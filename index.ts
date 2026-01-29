@@ -228,24 +228,58 @@ const honchoPlugin = {
       try {
         await ensureInitialized();
 
-        const session = await honcho.session(sessionKey, {
-          metadata: {
-            moltbotSessionKey: sessionKey,
-            createdAt: new Date().toISOString(),
-          },
-        });
+        // Get session reference
+        let session = await honcho.session(sessionKey);
 
-        // Idempotent peer addition (using tuple format)
+        // Try to get metadata; if session doesn't exist, create it
+        let meta: Record<string, unknown>;
+        try {
+          meta = await session.getMetadata();
+        } catch (e: unknown) {
+          // Session doesn't exist - create it with initial metadata
+          const isNotFound =
+            e instanceof Error &&
+            (e.name === "NotFoundError" || e.message.toLowerCase().includes("not found"));
+          if (!isNotFound) throw e;
+
+          // Create session by calling honcho.session with metadata
+          session = await honcho.session(sessionKey, {
+            metadata: { lastSavedIndex: 0 },
+          });
+          meta = await session.getMetadata();
+        }
+
+        const lastSavedIndex = (meta.lastSavedIndex as number) ?? 0;
+
+        // Add peers (session now guaranteed to exist)
         await session.addPeers([
           [OWNER_ID, { observeMe: true, observeOthers: false }],
           [MOLTBOT_ID, { observeMe: true, observeOthers: true }],
         ]);
 
-        const messages = extractMessages(event.messages, ownerPeer!, moltbotPeer!);
-        if (messages.length > 0) {
-          await session.addMessages(messages);
-          api.logger.info?.(`Saved ${messages.length} messages to Honcho`);
+        // Skip if nothing new
+        if (event.messages.length <= lastSavedIndex) {
+          api.logger.debug?.("No new messages to save");
+          return;
         }
+
+        // Extract only NEW messages (slice from lastSavedIndex)
+        const newRawMessages = event.messages.slice(lastSavedIndex);
+        const messages = extractMessages(newRawMessages, ownerPeer!, moltbotPeer!);
+
+        if (messages.length === 0) {
+          // Update index even if no saveable content (e.g., tool-only messages)
+          await session.setMetadata({ ...meta, lastSavedIndex: event.messages.length });
+          return;
+        }
+
+        // Save new messages
+        await session.addMessages(messages);
+
+        // Update watermark in Honcho
+        await session.setMetadata({ ...meta, lastSavedIndex: event.messages.length });
+
+        api.logger.info?.(`Saved ${messages.length} new messages to Honcho (index ${lastSavedIndex} → ${event.messages.length})`);
       } catch (error) {
         api.logger.error(`Failed to save messages to Honcho: ${error}`);
       }
@@ -268,32 +302,96 @@ const honchoPlugin = {
         }),
         async execute(_toolCallId, params) {
           const { query } = params as { query: string };
+          const answer = await moltbotPeer!.chat(query, { target: ownerPeer! });
+          return {
+            content: [{ type: "text", text: answer! }],
+          };
+        },
+      },
+      { name: "honcho_ask" }
+    );
 
-          try {
-            await ensureInitialized();
-            const answer = await moltbotPeer!.chat(query, { target: ownerPeer! });
+    // ========================================================================
+    // TOOL: honcho_search — Semantic search over memory context
+    // ========================================================================
+    api.registerTool(
+      {
+        name: "honcho_search",
+        label: "Search Honcho Memory",
+        description:
+          "Semantic search over Honcho's stored knowledge about the user. Use when you need to find specific facts, preferences, or past context that matches a search query. Returns relevant conclusions from Honcho's memory.",
+        parameters: Type.Object({
+          query: Type.String({
+            description:
+              "Search query to find relevant memories (e.g., 'coding preferences', 'favorite tools', 'project goals')",
+          }),
+          topK: Type.Optional(
+            Type.Number({
+              description:
+                "Number of relevant results to return (1-100, default: 10)",
+              minimum: 1,
+              maximum: 100,
+            })
+          ),
+          maxDistance: Type.Optional(
+            Type.Number({
+              description:
+                "Maximum semantic distance for results (0.0-1.0, lower = stricter matching, default: 0.5)",
+              minimum: 0,
+              maximum: 1,
+            })
+          ),
+        }),
+        async execute(_toolCallId, params) {
+          const { query, topK, maxDistance } = params as {
+            query: string;
+            topK?: number;
+            maxDistance?: number;
+          };
+
+          await ensureInitialized();
+
+          // Use peer representation with semantic search
+          // This searches Honcho's conclusions about the user
+          const [representation, card] = await Promise.all([
+            ownerPeer!.representation({
+              searchQuery: query,
+              searchTopK: topK ?? 10,
+              searchMaxDistance: maxDistance ?? 1.0,
+              includeMostFrequent: true,
+            }),
+            ownerPeer!.card().catch(() => null),
+          ]);
+
+          const results: string[] = [];
+
+          if (representation) {
+            results.push("## Relevant Context\n");
+            results.push(representation);
+          }
+
+          if (card?.length) {
+            results.push("\n## Key Facts\n");
+            results.push(card.map((f) => `- ${f}`).join("\n"));
+          }
+
+          if (results.length === 0) {
             return {
               content: [
                 {
                   type: "text",
-                  text: answer ?? "No information available about this topic yet.",
-                },
-              ],
-            };
-          } catch (error) {
-            api.logger.error(`honcho_ask failed: ${error}`);
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: "Failed to query memory. Service may be unavailable.",
+                  text: `No relevant memories found for query: "${query}"`,
                 },
               ],
             };
           }
+
+          return {
+            content: [{ type: "text", text: results.join("\n") }],
+          };
         },
       },
-      { name: "honcho_ask" }
+      { name: "honcho_search" }
     );
 
     // ========================================================================
@@ -349,12 +447,37 @@ const honchoPlugin = {
               console.error(`Failed to sync: ${error}`);
             }
           });
+
+        cmd
+          .command("search <query>")
+          .description("Semantic search over Honcho memory")
+          .option("-k, --top-k <number>", "Number of results to return", "10")
+          .option("-d, --max-distance <number>", "Maximum semantic distance (0-1)", "0.5")
+          .action(async (query: string, options: { topK: string; maxDistance: string }) => {
+            try {
+              await ensureInitialized();
+              const representation = await ownerPeer!.representation({
+                searchQuery: query,
+                searchTopK: parseInt(options.topK, 10),
+                searchMaxDistance: parseFloat(options.maxDistance),
+              });
+
+              if (!representation) {
+                console.log(`No relevant memories found for: "${query}"`);
+                return;
+              }
+
+              console.log(representation);
+            } catch (error) {
+              console.error(`Search failed: ${error}`);
+            }
+          });
       },
       { commands: ["honcho"] }
     );
 
     // ========================================================================
-    // Service: Daily sync at midnight
+    // Service: Periodic sync (configurable frequency)
     // ========================================================================
     if (cfg.dailySyncEnabled) {
       let timeoutId: NodeJS.Timeout | null = null;
@@ -364,10 +487,7 @@ const honchoPlugin = {
         id: "honcho-daily-sync",
 
         start(svcCtx) {
-          const now = new Date();
-          const midnight = new Date(now);
-          midnight.setHours(24, 0, 0, 0);
-          const msUntilMidnight = midnight.getTime() - now.getTime();
+          const syncIntervalMs = cfg.syncFrequency * 60 * 1000;
 
           const doSync = async () => {
             try {
@@ -389,13 +509,11 @@ const honchoPlugin = {
           timeoutId = setTimeout(() => {
             doSync();
 
-            // Then every 24 hours
-            intervalId = setInterval(doSync, 24 * 60 * 60 * 1000);
-          }, msUntilMidnight);
+            // Then repeat at configured interval
+            intervalId = setInterval(doSync, syncIntervalMs);
+          }, syncIntervalMs);
 
-          svcCtx.logger.info(
-            `Daily sync scheduled (in ${Math.round(msUntilMidnight / 1000 / 60)} min)`
-          );
+          svcCtx.logger.info(`Periodic sync scheduled (every ${cfg.syncFrequency} min)`);
         },
 
         stop(svcCtx) {
