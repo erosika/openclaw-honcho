@@ -312,6 +312,89 @@ const honchoPlugin = {
     );
 
     // ========================================================================
+    // TOOL: honcho_search — Semantic search over memory context
+    // ========================================================================
+    api.registerTool(
+      {
+        name: "honcho_search",
+        label: "Search Honcho Memory",
+        description:
+          "Semantic search over Honcho's stored knowledge about the user. Use when you need to find specific facts, preferences, or past context that matches a search query. Returns relevant conclusions from Honcho's memory.",
+        parameters: Type.Object({
+          query: Type.String({
+            description:
+              "Search query to find relevant memories (e.g., 'coding preferences', 'favorite tools', 'project goals')",
+          }),
+          topK: Type.Optional(
+            Type.Number({
+              description:
+                "Number of relevant results to return (1-100, default: 10)",
+              minimum: 1,
+              maximum: 100,
+            })
+          ),
+          maxDistance: Type.Optional(
+            Type.Number({
+              description:
+                "Maximum semantic distance for results (0.0-1.0, lower = stricter matching, default: 0.5)",
+              minimum: 0,
+              maximum: 1,
+            })
+          ),
+        }),
+        async execute(_toolCallId, params) {
+          const { query, topK, maxDistance } = params as {
+            query: string;
+            topK?: number;
+            maxDistance?: number;
+          };
+
+          await ensureInitialized();
+
+          // Use peer representation with semantic search
+          // This searches Honcho's conclusions about the user
+          const [representation, card] = await Promise.all([
+            ownerPeer!.representation({
+              searchQuery: query,
+              searchTopK: topK ?? 10,
+              searchMaxDistance: maxDistance ?? 1.0,
+              includeMostFrequent: true,
+            }),
+            ownerPeer!.card().catch(() => null),
+          ]);
+
+          const results: string[] = [];
+
+          if (representation) {
+            results.push("## Relevant Context\n");
+            results.push(representation);
+          }
+
+          if (card?.length) {
+            results.push("\n## Key Facts\n");
+            results.push(card.map((f) => `- ${f}`).join("\n"));
+          }
+
+          if (results.length === 0) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `No relevant memories found for query: "${query}"`,
+                },
+              ],
+            };
+          }
+
+          return {
+            content: [{ type: "text", text: results.join("\n") }],
+          };
+        },
+      },
+      { name: "honcho_search" }
+    );
+
+    // ========================================================================
     // CLI Commands
     // ========================================================================
     api.registerCli(
@@ -362,6 +445,31 @@ const honchoPlugin = {
               console.log("Synced Honcho representations to workspace files");
             } catch (error) {
               console.error(`Failed to sync: ${error}`);
+            }
+          });
+
+        cmd
+          .command("search <query>")
+          .description("Semantic search over Honcho memory")
+          .option("-k, --top-k <number>", "Number of results to return", "10")
+          .option("-d, --max-distance <number>", "Maximum semantic distance (0-1)", "0.5")
+          .action(async (query: string, options: { topK: string; maxDistance: string }) => {
+            try {
+              await ensureInitialized();
+              const representation = await ownerPeer!.representation({
+                searchQuery: query,
+                searchTopK: parseInt(options.topK, 10),
+                searchMaxDistance: parseFloat(options.maxDistance),
+              });
+
+              if (!representation) {
+                console.log(`No relevant memories found for: "${query}"`);
+                return;
+              }
+
+              console.log(representation);
+            } catch (error) {
+              console.error(`Search failed: ${error}`);
             }
           });
       },
