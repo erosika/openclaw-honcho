@@ -1,51 +1,47 @@
-# Honcho Memory Plugin for Moltbot
+# Honcho Memory Plugin for OpenClaw
 
-AI-native memory with dialectic reasoning for Moltbot. Uses [Honcho's](https://honcho.dev) peer paradigm to build and maintain separate models of the user and the agent — enabling context-aware conversations that improve over time. No local infrastructure required.
+AI-native memory with dialectic reasoning for OpenClaw. Uses [Honcho's](https://honcho.dev) peer paradigm to build and maintain separate models of the user and the agent — enabling context-aware conversations that improve over time. No local infrastructure required.
 
-This plugin uses Moltbot's slot system (`kind: "memory"`) to replace the built-in memory plugins (`memory-core`, `memory-lancedb`). During installation, existing memory files are migrated to Honcho as conclusions, and workspace docs (`SOUL.md`, `AGENTS.md`, `BOOTSTRAP.md`) are synced from plugin templates.
+This plugin uses OpenClaw's slot system (`kind: "memory"`) to replace the built-in memory plugins (`memory-core`, `memory-lancedb`). During installation, existing memory files are migrated to Honcho as conclusions, and workspace docs (`SOUL.md`, `AGENTS.md`, `BOOTSTRAP.md`) are synced from plugin templates.
 
 ## Install
 
 ```bash
-moltbot plugins install @plastic-labs/moltbot-honcho
+openclaw plugins install @plastic-labs/openclaw-honcho
 ```
 
-Reminder: installing this plugin deletes your clawdbot/moltbot memory files. Make sure they are saved to version control first.
+The install script automatically:
+1. Syncs workspace docs (`SOUL.md`, `AGENTS.md`, `BOOTSTRAP.md`)
+2. Migrates any existing memory to Honcho (if `HONCHO_API_KEY` is set)
+3. Removes legacy memory files (`USER.md`, `MEMORY.md`, `memory/` directory)
 
-Restart Moltbot after installing.
+**Important:** Make sure any existing memory files are saved to version control before installing.
+
+Restart the gateway after installing:
+
+```bash
+openclaw gateway restart
+```
+
+Start chatting and ask it questions to use its tools:
+- Chat in terminal: `openclaw tui`
+- Watch the logs: `openclaw logs --follow`
 
 ## Configuration
 
 The only required value is your Honcho API key. Get one at [honcho.dev](https://honcho.dev).
 
-Set it as an environment variable:
+Add it to OpenClaw's global env file:
 
 ```bash
-export HONCHO_API_KEY="hc_..."
-```
-
-Or configure it directly in `moltbot.json`:
-
-```json5
-{
-  "plugins": {
-    "entries": {
-      "moltbot-honcho": {
-        "enabled": true,
-        "config": {
-          "apiKey": "${HONCHO_API_KEY}"
-        }
-      }
-    }
-  }
-}
+echo "HONCHO_API_KEY=your_honcho_api_key_here" >> ~/.openclaw/.env
 ```
 
 ### Advanced options
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `workspaceId` | `string` | `"moltbot"` | Honcho workspace ID for memory isolation. |
+| `workspaceId` | `string` | `"openclaw"` | Honcho workspace ID for memory isolation. |
 | `baseUrl` | `string` | `"https://api.honcho.dev"` | API endpoint (for self-hosted instances). |
 
 ## How it works
@@ -64,12 +60,12 @@ The plugin manages markdown files in your workspace:
 
 | File | Contents |
 |------|----------|
-| `SOUL.md` | Agent profile — Moltbot's self-model and personality. |
+| `SOUL.md` | Agent profile — OpenClaw's self-model and personality. |
 | `AGENTS.md` | Agent capabilities and tool descriptions. |
 | `BOOTSTRAP.md` | Initial context and instructions for the agent. |
 | `IDENTITY.md` | Static agent identity (unchanged by Honcho). |
 
-Reminder: legacy files (`USER.md`, `MEMORY.md`, `memory/` directory) are migrated to Honcho during installation and removed from the workspace. Commit them to version control before installing.
+**Important:** Legacy files (`USER.md`, `MEMORY.md`, `memory/` directory) are migrated to Honcho and removed automatically during installation. Commit them to version control before installing.
 
 ## AI Tools
 
@@ -94,7 +90,7 @@ The plugin provides both **data retrieval tools** (cheap, fast, raw data) and **
 ## CLI Commands
 
 ```bash
-moltbot honcho status                          # Show connection status and representation sizes
-moltbot honcho ask <question>                  # Query Honcho about the user
-moltbot honcho search <query> [-k N] [-d D]    # Semantic search over memory (topK, maxDistance)
+openclaw honcho status                          # Show connection status and representation sizes
+openclaw honcho ask <question>                  # Query Honcho about the user
+openclaw honcho search <query> [-k N] [-d D]    # Semantic search over memory (topK, maxDistance)
 ```

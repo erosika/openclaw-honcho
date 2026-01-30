@@ -1,33 +1,34 @@
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { Honcho } from "@honcho-ai/sdk";
 
-// Reminder: this install deletes clawdbot/moltbot memory files; commit them first.
-const MEMORY_DELETION_WARNING =
-  "Reminder: installing this plugin deletes your clawdbot/moltbot memory files. Save them to version control first.";
-console.warn(MEMORY_DELETION_WARNING);
+// ============================================================================
+// Install script: Sync workspace docs, migrate data to Honcho, clean up legacy files
+// ============================================================================
 
-const OWNER_ID = "owner";
-const MOLTBOT_ID = "moltbot";
+// Load API key from ~/.openclaw/.env if not already in environment
+async function loadEnvFile() {
+  const envPath = path.join(os.homedir(), ".openclaw", ".env");
+  try {
+    const content = await fs.promises.readFile(envPath, "utf8");
+    for (const line of content.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const match = trimmed.match(/^([^=]+)=(.*)$/);
+      if (match) {
+        const key = match[1].trim();
+        const value = match[2].trim().replace(/^["']|["']$/g, ""); // strip quotes
+        if (!process.env[key]) {
+          process.env[key] = value;
+        }
+      }
+    }
+  } catch {
+    // .env file doesn't exist, that's fine
+  }
+}
 
-const filesToBackup = [
-  "AGENTS.md",
-  "IDENTITY.md",
-  "MEMORY.md",
-  "TOOLS.md",
-  "BOOTSTRAP.md",
-  "HEARTBEAT.md",
-  "SOUL.md",
-  "USER.md",
-];
-
-const dirsToBackup = ["memory", "canvas"];
-
-// Files that contain information ABOUT the owner (observed by moltbot)
-const ownerFiles = new Set(["USER.md", "IDENTITY.md", "MEMORY.md"]);
-// Files that contain information ABOUT moltbot itself (self-conclusions)
-const moltbotFiles = new Set(["SOUL.md", "AGENTS.md", "TOOLS.md", "BOOTSTRAP.md", "HEARTBEAT.md"]);
+await loadEnvFile();
 
 const explicitWorkspace = process.env.WORKSPACE_ROOT;
 const workspaceRoot = await resolveWorkspaceRoot();
@@ -35,10 +36,7 @@ const workspaceRoot = await resolveWorkspaceRoot();
 const docsToSync = [
   { sources: ["workspace_md/BOOTSTRAP.md"], targets: ["BOOTSTRAP.md"] },
   { sources: ["workspace_md/SOUL.md"], targets: ["SOUL.md"] },
-  {
-    sources: ["workspace_md/AGENTS.md"],
-    targets: ["AGENTS.md"],
-  },
+  { sources: ["workspace_md/AGENTS.md"], targets: ["AGENTS.md"] },
 ];
 
 async function fileExists(filePath) {
@@ -51,7 +49,7 @@ async function fileExists(filePath) {
 }
 
 async function loadWorkspaceFromConfig() {
-  const configPath = path.join(os.homedir(), ".clawdbot", "moltbot.json");
+  const configPath = path.join(os.homedir(), ".openclaw", "openclaw.json");
   try {
     const raw = await fs.promises.readFile(configPath, "utf8");
     const parsed = JSON.parse(raw);
@@ -74,12 +72,7 @@ async function resolveWorkspaceRoot() {
   const configured = await loadWorkspaceFromConfig();
   if (configured) candidates.push(configured);
 
-  const profile = process.env.CLAWDBOT_PROFILE;
-  if (profile && profile !== "default") {
-    candidates.push(path.join(os.homedir(), `clawd-${profile}`));
-  }
-
-  candidates.push(path.join(os.homedir(), "clawd"), path.join(os.homedir(), "moltbot"));
+  candidates.push(path.join(os.homedir(), ".openclaw", "workspace"));
 
   for (const candidate of candidates) {
     if (!candidate) continue;
@@ -90,18 +83,6 @@ async function resolveWorkspaceRoot() {
   }
 
   return process.cwd();
-}
-
-async function hasAnyMemoryFiles(root) {
-  for (const file of filesToBackup) {
-    if (await fileExists(path.join(root, file))) return true;
-  }
-
-  for (const dir of dirsToBackup) {
-    if (await fileExists(path.join(root, dir))) return true;
-  }
-
-  return false;
 }
 
 async function updateWorkspaceDocs() {
@@ -136,136 +117,206 @@ async function resolveDocSource(repoRoot, sources) {
   return null;
 }
 
-function formatConclusion(relativePath, content) {
-  const trimmed = content.trim();
-  if (!trimmed) return "";
-  return `Memory file: ${relativePath}\n\n${trimmed}`;
-}
+// ============================================================================
+// Migration: Move legacy memory files to Honcho and delete them
+// ============================================================================
+
+// Files that contain information ABOUT the owner (observed by openclaw)
+const ownerFiles = new Set(["USER.md", "IDENTITY.md", "MEMORY.md"]);
+// Files that contain information ABOUT openclaw itself (self-conclusions)
+const openclawFiles = new Set(["SOUL.md", "AGENTS.md", "TOOLS.md", "BOOTSTRAP.md", "HEARTBEAT.md"]);
+
+const filesToMigrate = [
+  "AGENTS.md", "IDENTITY.md", "MEMORY.md", "TOOLS.md",
+  "BOOTSTRAP.md", "HEARTBEAT.md", "SOUL.md", "USER.md",
+];
+const dirsToMigrate = ["memory", "canvas"];
+
+// Files/dirs to delete after migration (legacy files that interfere with plugin)
+const filesToDelete = ["USER.md", "MEMORY.md"];
+const dirsToDelete = ["memory"];
 
 function isAboutOwner(relativePath) {
   const baseName = path.basename(relativePath);
   if (ownerFiles.has(baseName)) return true;
-  if (moltbotFiles.has(baseName)) return false;
-  // Default: files in memory/canvas dirs are about the owner
-  return true;
+  if (openclawFiles.has(baseName)) return false;
+  return true; // Default: files in memory/canvas dirs are about the owner
 }
 
-async function addFileConclusion(filePath, relativePath, conclusions) {
-  try {
-    const content = await fs.promises.readFile(filePath, "utf8");
-    const formatted = formatConclusion(relativePath, content);
-    if (!formatted) return;
-    conclusions.push({
-      content: formatted,
-      isAboutOwner: isAboutOwner(relativePath),
-    });
-    console.log(`Queued: ${relativePath}`);
-  } catch (error) {
-    console.error(`Error reading ${relativePath}:`, error);
-  }
-}
-
-async function backupDirectory(dirPath, relativePath, conclusions) {
+async function collectFromDir(dirPath, relativePath, conclusions) {
   const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
-
   for (const entry of entries) {
     const fullPath = path.join(dirPath, entry.name);
     const nextRelative = path.join(relativePath, entry.name);
-
     if (entry.isDirectory()) {
-      await backupDirectory(fullPath, nextRelative, conclusions);
+      await collectFromDir(fullPath, nextRelative, conclusions);
     } else if (entry.isFile()) {
-      await addFileConclusion(fullPath, nextRelative, conclusions);
+      try {
+        const content = (await fs.promises.readFile(fullPath, "utf8")).trim();
+        if (content) {
+          conclusions.push({
+            content: `Memory file: ${nextRelative}\n\n${content}`,
+            isAboutOwner: isAboutOwner(nextRelative),
+          });
+          console.log(`  Found: ${nextRelative}`);
+        }
+      } catch (e) {
+        console.warn(`  Warning: Could not read ${nextRelative}`);
+      }
     }
   }
 }
 
-async function cleanupLegacyMemoryFiles() {
-  const filesToDelete = ["USER.md", "MEMORY.md"];
-  const dirsToDelete = ["memory"];
+async function migrateAndCleanup() {
+  console.log("");
+  console.log("Migrating legacy memory files...");
+  console.log(`Workspace: ${workspaceRoot}`);
+  console.log("");
+
+  const conclusions = [];
+
+  // Collect from individual files
+  for (const file of filesToMigrate) {
+    const filePath = path.join(workspaceRoot, file);
+    try {
+      const content = (await fs.promises.readFile(filePath, "utf8")).trim();
+      if (content) {
+        conclusions.push({
+          content: `Memory file: ${file}\n\n${content}`,
+          isAboutOwner: isAboutOwner(file),
+        });
+        console.log(`  Found: ${file}`);
+      }
+    } catch {
+      // File doesn't exist, skip
+    }
+  }
+
+  // Collect from directories
+  for (const dir of dirsToMigrate) {
+    const dirPath = path.join(workspaceRoot, dir);
+    try {
+      await fs.promises.stat(dirPath);
+      await collectFromDir(dirPath, dir, conclusions);
+    } catch {
+      // Directory doesn't exist, skip
+    }
+  }
+
+  const ownerConclusions = conclusions.filter((c) => c.isAboutOwner);
+  const selfConclusions = conclusions.filter((c) => !c.isAboutOwner);
+
+  if (conclusions.length > 0) {
+    console.log("");
+    console.log(`Found ${conclusions.length} files to migrate:`);
+    console.log(`  - ${ownerConclusions.length} about the user (USER.md, IDENTITY.md, etc.)`);
+    console.log(`  - ${selfConclusions.length} about openclaw (SOUL.md, AGENTS.md, etc.)`);
+  }
+
+  // Try to migrate to Honcho if API key is available
+  const apiKey = process.env.HONCHO_API_KEY;
+  if (apiKey) {
+    try {
+      console.log("");
+      console.log("Migrating to Honcho...");
+
+      const { Honcho } = await import("@honcho-ai/sdk");
+      const honcho = new Honcho({
+        apiKey,
+        baseURL: process.env.HONCHO_BASE_URL || "https://api.honcho.dev",
+        workspaceId: process.env.HONCHO_WORKSPACE_ID || "openclaw",
+      });
+
+      // Ensure workspace exists (idempotent)
+      await honcho.setMetadata({});
+
+      // Get or create peers (passing metadata triggers creation)
+      const openclawPeer = await honcho.peer("openclaw", { metadata: {} });
+      const ownerPeer = await honcho.peer("owner", { metadata: {} });
+
+      if (ownerConclusions.length > 0) {
+        await openclawPeer.conclusionsOf(ownerPeer).create(
+          ownerConclusions.map((c) => ({ content: c.content }))
+        );
+        console.log(`  ✓ Created ${ownerConclusions.length} conclusions about user`);
+      }
+
+      if (selfConclusions.length > 0) {
+        await openclawPeer.conclusions.create(
+          selfConclusions.map((c) => ({ content: c.content }))
+        );
+        console.log(`  ✓ Created ${selfConclusions.length} openclaw self-conclusions`);
+      }
+
+      // Migration succeeded - continue to cleanup
+    } catch (error) {
+      console.error("");
+      console.error(`Error: Could not migrate to Honcho: ${error.message}`);
+      console.error("Legacy files will NOT be removed to prevent data loss.");
+      console.error("Fix the issue above and re-run the install.");
+      return;
+    }
+  } else {
+    console.log("");
+    console.error("Error: HONCHO_API_KEY not set.");
+    console.error("Legacy files will NOT be removed to prevent data loss.");
+    console.error("");
+    console.error("Set your API key first:");
+    console.error("  echo 'HONCHO_API_KEY=hc_...' >> ~/.openclaw/.env");
+    console.error("");
+    console.error("Then re-run: npm install");
+    return;
+  }
+
+  // Only clean up legacy files if migration succeeded
+  console.log("");
+  console.log("Cleaning up legacy files...");
 
   for (const file of filesToDelete) {
     const targetPath = path.join(workspaceRoot, file);
-    await fs.promises.rm(targetPath, { force: true });
-    console.log(`Removed legacy workspace file: ${file}`);
+    if (await fileExists(targetPath)) {
+      await fs.promises.rm(targetPath);
+      if (await fileExists(targetPath)) {
+        console.error(`  Failed to remove: ${file}`);
+      } else {
+        console.log(`  Removed: ${file}`);
+      }
+    }
   }
 
   for (const dir of dirsToDelete) {
     const targetPath = path.join(workspaceRoot, dir);
-    await fs.promises.rm(targetPath, { recursive: true, force: true });
-    console.log(`Removed legacy workspace directory: ${dir}`);
+    if (await fileExists(targetPath)) {
+      await fs.promises.rm(targetPath, { recursive: true });
+      if (await fileExists(targetPath)) {
+        console.error(`  Failed to remove: ${dir}/`);
+      } else {
+        console.log(`  Removed: ${dir}/`);
+      }
+    }
   }
+
+  console.log("");
+  console.log("✓ Migration complete!");
 }
 
-async function backupToHoncho() {
-  console.log("Starting one-time backup of memory files to Honcho using conclusions...");
+// ============================================================================
+// Main
+// ============================================================================
+
+async function main() {
+  console.log("Installing openclaw-honcho plugin...");
   console.log(`Workspace root: ${workspaceRoot}`);
 
-  const apiKey = process.env.HONCHO_API_KEY;
-  const baseURL = process.env.HONCHO_BASE_URL ?? "https://api.honcho.dev";
-  const workspaceId = process.env.HONCHO_WORKSPACE_ID ?? "moltbot";
-
-  if (!apiKey) {
-    console.warn("HONCHO_API_KEY is not set. Skipping one-time backup.");
-    return;
-  }
-
-  const honcho = new Honcho({ apiKey, baseURL, workspaceId });
-  const moltbotPeer = await honcho.peer(MOLTBOT_ID);
-  const ownerPeer = await honcho.peer(OWNER_ID);
-
-  const conclusions = [];
-
-  // Collect conclusions from individual files
-  for (const file of filesToBackup) {
-    const filePath = path.join(workspaceRoot, file);
-    if (await fileExists(filePath)) {
-      await addFileConclusion(filePath, file, conclusions);
-    }
-  }
-
-  // Collect conclusions from directories
-  for (const dir of dirsToBackup) {
-    const dirPath = path.join(workspaceRoot, dir);
-    if (await fileExists(dirPath)) {
-      await backupDirectory(dirPath, dir, conclusions);
-    }
-  }
-
-  if (!conclusions.length) {
-    console.log("No memory files found to back up.");
-    return;
-  }
-
-  // Separate conclusions by type
-  const ownerConclusions = conclusions
-    .filter((c) => c.isAboutOwner)
-    .map((c) => ({ content: c.content }));
-
-  const selfConclusions = conclusions
-    .filter((c) => !c.isAboutOwner)
-    .map((c) => ({ content: c.content }));
-
-  // Create conclusions in batch
-  if (ownerConclusions.length > 0) {
-    // Moltbot's conclusions about the owner
-    await moltbotPeer.conclusionsOf(ownerPeer).create(ownerConclusions);
-    console.log(`Created ${ownerConclusions.length} conclusions about owner`);
-  }
-
-  if (selfConclusions.length > 0) {
-    // Moltbot's self-conclusions
-    await moltbotPeer.conclusions.create(selfConclusions);
-    console.log(`Created ${selfConclusions.length} moltbot self-conclusions`);
-  }
-
   await updateWorkspaceDocs();
-  await cleanupLegacyMemoryFiles();
+  await migrateAndCleanup();
 
-  console.log(`One-time backup completed (${conclusions.length} total conclusions created).`);
+  console.log("");
+  console.log("✓ Plugin installed successfully!");
+  console.log("");
 }
 
-backupToHoncho().catch((error) => {
-  console.error("Backup failed:", error);
+main().catch((error) => {
+  console.error("Install failed:", error);
   process.exit(1);
 });
