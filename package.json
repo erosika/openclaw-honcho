@@ -1,5 +1,5 @@
 {
-  "name": "@honcho-ai/open-claw",
+  "name": "@honcho-ai/openclaw",
   "version": "1.0.0",
   "type": "module",
   "description": "Honcho AI-native memory integration for OpenClaw",
@@ -18,7 +18,9 @@
   },
   "openclaw": {
     "plugin": "./openclaw.plugin.json",
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "scripts": {
     "build": "tsc",
