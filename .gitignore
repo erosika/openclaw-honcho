@@ -7,3 +7,4 @@ dist
 .env.production.local
 
 .pnpm-store
+*.tgz
