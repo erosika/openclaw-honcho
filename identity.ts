@@ -108,9 +108,12 @@ export async function loadIdentityContext(
     representation: null,
   };
 
+  // Clear the timer when layers resolve to prevent leaking timers in long-running processes.
+  let timer: ReturnType<typeof setTimeout>;
   await Promise.race([
-    loadLayers(ownerPeer, alignmentQueries, representationQuery, maxConclusions, searchTopK, partial),
-    new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+    loadLayers(ownerPeer, alignmentQueries, representationQuery, maxConclusions, searchTopK, partial)
+      .finally(() => clearTimeout(timer)),
+    new Promise<void>((resolve) => { timer = setTimeout(resolve, timeoutMs); }),
   ]);
 
   let { peerCard, alignmentResponses, representation } = partial;

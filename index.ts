@@ -728,41 +728,41 @@ Use honcho_search if you want the raw evidence to reason over yourself.`,
           };
 
           try {
-          await ensureInitialized();
+            await ensureInitialized();
 
-          let representation = await ownerPeer!.representation({
-            searchQuery: query,
-            searchTopK: topK ?? 10,
-            searchMaxDistance: maxDistance ?? 0.5,
-          });
+            let representation = await ownerPeer!.representation({
+              searchQuery: query,
+              // Floor topK to integer — Honcho expects whole numbers
+              searchTopK: Math.floor(topK ?? 10),
+              searchMaxDistance: maxDistance ?? 0.5,
+            });
 
-          if (!representation) {
+            if (!representation) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `No memories found matching: "${query}"\n\nTry broadening your search or increasing maxDistance.`,
+                  },
+                ],
+                details: undefined,
+              };
+            }
+
+            // Apply safety filter to tool results when enabled, preventing
+            // operational data from leaking through tool calls even though
+            // the identity loading filters it from the system prompt.
+            if (cfg.enableSafetyFilter) {
+              representation = stripInternalContext(representation, DEFAULT_SAFETY_PATTERNS) ?? "";
+            }
+
             return {
-              content: [
-                {
-                  type: "text",
-                  text: `No memories found matching: "${query}"\n\nTry broadening your search or increasing maxDistance.`,
-                },
-              ],
+              content: [{ type: "text", text: representation ? `## Search Results: "${query}"\n\n${representation}` : `No relevant results for "${query}" after filtering.` }],
               details: undefined,
             };
-          }
-
-          // Apply safety filter to tool results when enabled, preventing
-          // operational data from leaking through tool calls even though
-          // the identity loading filters it from the system prompt.
-          if (cfg.enableSafetyFilter) {
-            // stripInternalContext and DEFAULT_SAFETY_PATTERNS imported at top level
-            representation = stripInternalContext(representation, DEFAULT_SAFETY_PATTERNS) ?? "";
-          }
-
-          return {
-            content: [{ type: "text", text: representation ? `## Search Results: "${query}"\n\n${representation}` : `No relevant results for "${query}" after filtering.` }],
-            details: undefined,
-          };
           } catch (error) {
             return {
-              content: [{ type: "text", text: `Memory search temporarily unavailable. Try again shortly.` }],
+              content: [{ type: "text", text: "Memory search temporarily unavailable. Try again shortly." }],
               details: undefined,
             };
           }
@@ -825,41 +825,40 @@ Parameters:
           };
 
           try {
-          await ensureInitialized();
+            await ensureInitialized();
 
-          let representation = await ownerPeer!.representation({
-            includeMostFrequent: includeMostFrequent ?? true,
-          });
+            let representation = await ownerPeer!.representation({
+              includeMostFrequent: includeMostFrequent ?? true,
+            });
 
-          if (!representation) {
+            if (!representation) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: "No context available yet. Context builds over time through conversations.",
+                  },
+                ],
+                details: undefined,
+              };
+            }
+
+            // Apply safety filter to tool results when enabled
+            if (cfg.enableSafetyFilter) {
+              representation = stripInternalContext(representation, DEFAULT_SAFETY_PATTERNS) ?? "";
+            }
+
+            if (!representation) {
+              return {
+                content: [{ type: "text", text: "Context available but filtered for safety. Try honcho_profile for key facts." }],
+                details: undefined,
+              };
+            }
+
             return {
-              content: [
-                {
-                  type: "text",
-                  text: "No context available yet. Context builds over time through conversations.",
-                },
-              ],
+              content: [{ type: "text", text: `## User Context\n\n${representation}` }],
               details: undefined,
             };
-          }
-
-          // Apply safety filter to tool results when enabled
-          if (cfg.enableSafetyFilter) {
-            // stripInternalContext and DEFAULT_SAFETY_PATTERNS imported at top level
-            representation = stripInternalContext(representation, DEFAULT_SAFETY_PATTERNS) ?? "";
-          }
-
-          if (!representation) {
-            return {
-              content: [{ type: "text", text: "Context available but filtered for safety. Try honcho_profile for key facts." }],
-              details: undefined,
-            };
-          }
-
-          return {
-            content: [{ type: "text", text: `## User Context\n\n${representation}` }],
-            details: undefined,
-          };
           } catch (error) {
             return {
               content: [{ type: "text", text: "User context temporarily unavailable. Try honcho_profile for cached facts." }],
