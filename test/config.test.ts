@@ -155,6 +155,13 @@ describe("honchoConfigSchema.parse", () => {
     expect(cfg.apiKey).toBe("hc_resolved");
   });
 
+  it("returns undefined for unresolvable ${ENV_VAR} in apiKey", () => {
+    delete process.env.NONEXISTENT_KEY;
+    const cfg = honchoConfigSchema.parse({ apiKey: "${NONEXISTENT_KEY}" });
+    // Missing env var → undefined (not a crash)
+    expect(cfg.apiKey).toBeUndefined();
+  });
+
   it("parses identityTimeoutMs from config", () => {
     const cfg = honchoConfigSchema.parse({ identityTimeoutMs: 3000 });
     expect(cfg.identityTimeoutMs).toBe(3000);

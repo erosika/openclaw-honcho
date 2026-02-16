@@ -515,19 +515,9 @@ Parameters:
               );
             }
 
-            // Add peer card if available
-            if (context.peerCard?.length) {
-              sections.push(
-                `## User Profile\n\n${context.peerCard.map((f) => `• ${f}`).join("\n")}`
-              );
-            }
-
-            // Add peer representation if available
-            if (context.peerRepresentation) {
-              sections.push(
-                `## User Context\n\n${context.peerRepresentation}`
-              );
-            }
+            // NOTE: peerCard and peerRepresentation are intentionally excluded.
+            // They're cross-session (user-level) data, not session-scoped.
+            // Use honcho_profile or honcho_context for cross-session data.
 
             // Add messages if requested
             if (includeMessages && context.messages.length > 0) {
@@ -724,6 +714,7 @@ Use honcho_search if you want the raw evidence to reason over yourself.`,
             maxDistance?: number;
           };
 
+          try {
           await ensureInitialized();
 
           let representation = await ownerPeer!.representation({
@@ -756,6 +747,12 @@ Use honcho_search if you want the raw evidence to reason over yourself.`,
             content: [{ type: "text", text: representation ? `## Search Results: "${query}"\n\n${representation}` : `No relevant results for "${query}" after filtering.` }],
             details: undefined,
           };
+          } catch (error) {
+            return {
+              content: [{ type: "text", text: `Memory search temporarily unavailable. Try again shortly.` }],
+              details: undefined,
+            };
+          }
         },
       },
       { name: "honcho_search" }
@@ -814,6 +811,7 @@ Parameters:
             includeMostFrequent?: boolean;
           };
 
+          try {
           await ensureInitialized();
 
           let representation = await ownerPeer!.representation({
@@ -849,6 +847,12 @@ Parameters:
             content: [{ type: "text", text: `## User Context\n\n${representation}` }],
             details: undefined,
           };
+          } catch (error) {
+            return {
+              content: [{ type: "text", text: "User context temporarily unavailable. Try honcho_profile for cached facts." }],
+              details: undefined,
+            };
+          }
         },
       },
       { name: "honcho_context" }
@@ -906,15 +910,22 @@ Parameters:
           if (query.length > 500) {
             return { content: [{ type: "text", text: "Query too long. honcho_recall is for simple factual questions (max 500 chars). Use honcho_analyze for complex queries." }], details: undefined };
           }
-          await ensureInitialized();
-          const answer = await openclawPeer!.chat(query, {
-            target: ownerPeer!,
-            reasoningLevel: "minimal",
-          });
-          return {
-            content: [{ type: "text", text: answer ?? "I don't have enough information to answer that yet." }],
-            details: undefined,
-          };
+          try {
+            await ensureInitialized();
+            const answer = await openclawPeer!.chat(query, {
+              target: ownerPeer!,
+              reasoningLevel: "minimal",
+            });
+            return {
+              content: [{ type: "text", text: answer ?? "I don't have enough information to answer that yet." }],
+              details: undefined,
+            };
+          } catch (error) {
+            return {
+              content: [{ type: "text", text: "Memory recall temporarily unavailable. Try again shortly." }],
+              details: undefined,
+            };
+          }
         },
       },
       { name: "honcho_recall" }
@@ -971,15 +982,22 @@ Use honcho_analyze if you need Honcho to synthesize a complex answer.`,
           if (query.length > 2000) {
             return { content: [{ type: "text", text: "Query too long (max 2000 chars). Try a more focused question." }], details: undefined };
           }
-          await ensureInitialized();
-          const answer = await openclawPeer!.chat(query, {
-            target: ownerPeer!,
-            reasoningLevel: "medium",
-          });
-          return {
-            content: [{ type: "text", text: answer ?? "Not enough data to analyze this yet. More conversations will build the context needed." }],
-            details: undefined,
-          };
+          try {
+            await ensureInitialized();
+            const answer = await openclawPeer!.chat(query, {
+              target: ownerPeer!,
+              reasoningLevel: "medium",
+            });
+            return {
+              content: [{ type: "text", text: answer ?? "Not enough data to analyze this yet. More conversations will build the context needed." }],
+              details: undefined,
+            };
+          } catch (error) {
+            return {
+              content: [{ type: "text", text: "Analysis temporarily unavailable. Try honcho_recall for simpler questions, or try again shortly." }],
+              details: undefined,
+            };
+          }
         },
       },
       { name: "honcho_analyze" }
