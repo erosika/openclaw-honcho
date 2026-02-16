@@ -49,7 +49,6 @@ const honchoPlugin = {
     let ownerPeer: Peer | null = null;
     let openclawPeer: Peer | null = null;
     let initialized = false;
-    let initFailed = false;
     let initPromise: Promise<void> | null = null;
     let agentEndLock: Promise<void> | null = null;
     let currentSessionKey: string = "default";
@@ -92,9 +91,7 @@ const honchoPlugin = {
           ownerPeer = await honcho.peer(OWNER_ID, { metadata: {} });
           openclawPeer = await honcho.peer(OPENCLAW_ID, { metadata: {} });
           initialized = true;
-          initFailed = false;
         } catch (err) {
-          initFailed = true;
           initPromise = null; // Allow retry on next call
           throw err;
         }
@@ -354,10 +351,11 @@ const honchoPlugin = {
       } catch (error) {
         api.logger.error(`[honcho] Failed to save messages to Honcho: ${error}`);
         if (error instanceof Error) {
-          api.logger.error(`[honcho] Stack: ${error.stack}`);
           const anyError = error as unknown as Record<string, unknown>;
           if (anyError.status) api.logger.error(`[honcho] Status: ${anyError.status}`);
-          if (anyError.body) api.logger.error(`[honcho] Body: ${JSON.stringify(anyError.body)}`);
+          // Don't log full error body — it may contain user message content (PII risk).
+          // Log only the error type for debugging.
+          if (anyError.body) api.logger.error(`[honcho] Response body present (not logged for PII safety)`);
         }
       } finally {
         release!();
@@ -371,35 +369,41 @@ const honchoPlugin = {
       api.on("message_sending", async (event) => {
         if (!event.content) return;
 
-        // Extract text from string or content block array
-        let text: string;
-        if (typeof event.content === "string") {
-          text = event.content;
-        } else if (Array.isArray(event.content)) {
-          text = (event.content as Array<Record<string, unknown>>)
-            .filter((b) => b?.type === "text" && typeof b?.text === "string")
-            .map((b) => b.text as string)
-            .join("\n");
-        } else {
-          return;
-        }
+        try {
+          // Extract text from string or content block array
+          let text: string;
+          if (typeof event.content === "string") {
+            text = event.content;
+          } else if (Array.isArray(event.content)) {
+            text = (event.content as Array<Record<string, unknown>>)
+              .filter((b) => b?.type === "text" && typeof b?.text === "string")
+              .map((b) => b.text as string)
+              .join("\n");
+          } else {
+            return;
+          }
 
-        if (!text) return;
+          if (!text) return;
 
-        const result = scanOutbound(text);
+          const result = scanOutbound(text);
 
-        if (!result.safe) {
-          const blocked = result.findings.filter((f) => f.severity === "block");
-          api.logger.warn?.(
-            `[honcho] Outbound message blocked: ${blocked.map((f) => f.pattern).join(", ")}`,
-          );
-          return { cancel: true };
-        }
+          if (!result.safe) {
+            const blocked = result.findings.filter((f) => f.severity === "block");
+            api.logger.warn?.(
+              `[honcho] Outbound message blocked: ${blocked.map((f) => f.pattern).join(", ")}`,
+            );
+            return { cancel: true };
+          }
 
-        if (result.findings.length > 0) {
-          api.logger.warn?.(
-            `[honcho] Outbound warnings: ${result.findings.map((f) => f.pattern).join(", ")}`,
-          );
+          if (result.findings.length > 0) {
+            api.logger.warn?.(
+              `[honcho] Outbound warnings: ${result.findings.map((f) => f.pattern).join(", ")}`,
+            );
+          }
+        } catch (error) {
+          // Fail-open: let message through on scan error rather than blocking all communication.
+          // Scanning is pure functions with low failure probability; logging the error is sufficient.
+          api.logger.error?.(`[honcho] Outbound scan error (message allowed): ${error}`);
         }
 
         return;
@@ -488,13 +492,12 @@ Parameters:
             messageLimit?: number;
           };
 
-          await ensureInitialized();
-
-          // Use the session key tracked from before_agent_start (set per invocation).
-          // Not exposed as a tool parameter to prevent session key injection.
-          const sessionKey = currentSessionKey;
-
           try {
+            await ensureInitialized();
+
+            // Use the session key tracked from before_agent_start (set per invocation).
+            // Not exposed as a tool parameter to prevent session key injection.
+            const sessionKey = currentSessionKey;
             const session = await honcho.session(sessionKey);
 
             // Get session context with the specified options
@@ -577,7 +580,10 @@ Parameters:
               };
             }
 
-            throw error;
+            return {
+              content: [{ type: "text", text: "Session history temporarily unavailable. Try again shortly." }],
+              details: undefined,
+            };
           }
         },
       },
@@ -619,31 +625,38 @@ Parameters:
         Use honcho_profile if you want the key facts to reason over yourself.`,
         parameters: Type.Object({}),
         async execute(_toolCallId, _params) {
-          await ensureInitialized();
+          try {
+            await ensureInitialized();
 
-          const card = await ownerPeer!.getCard().catch(() => null);
+            const card = await ownerPeer!.getCard().catch(() => null);
 
-          if (!card?.length) {
+            if (!card?.length) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: "No profile facts available yet. The user's profile builds over time through conversations.",
+                  },
+                ],
+                details: undefined,
+              };
+            }
+
             return {
               content: [
                 {
                   type: "text",
-                  text: "No profile facts available yet. The user's profile builds over time through conversations.",
+                  text: `## User Profile\n\n${card.map((f) => `• ${f}`).join("\n")}`,
                 },
               ],
               details: undefined,
             };
+          } catch (error) {
+            return {
+              content: [{ type: "text", text: "User profile temporarily unavailable. Try again shortly." }],
+              details: undefined,
+            };
           }
-
-          return {
-            content: [
-              {
-                type: "text",
-                text: `## User Profile\n\n${card.map((f) => `• ${f}`).join("\n")}`,
-              },
-            ],
-            details: undefined,
-          };
         },
       },
       { name: "honcho_profile" }

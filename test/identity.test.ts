@@ -363,10 +363,16 @@ describe("loadIdentityContext", () => {
       timeoutMs: 50, // very short timeout
     });
 
-    // The timeout fires, returns empty defaults
-    // (In practice, the fast calls may complete before timeout, but
-    //  we're testing that it doesn't hang for 10s)
-    expect(result.systemPrompt).toBeDefined();
+    // The timeout fires before chat resolves, but fast layers are preserved
+    // because loadLayers writes results into a shared accumulator as they arrive.
+    expect(result.peerCard).toEqual(["fast fact"]);
+    expect(result.representation).toBe("fast context");
+    // Chat is too slow — should be empty
+    expect(result.alignmentResponses).toEqual([]);
+    expect(result.systemPrompt).toContain("## Identity");
+    expect(result.systemPrompt).toContain("fast fact");
+    expect(result.systemPrompt).toContain("## Recent Context");
+    expect(result.systemPrompt).not.toContain("slow answer");
   }, 2000); // test itself must complete in 2s
 
   it("handles all layers failing gracefully", async () => {

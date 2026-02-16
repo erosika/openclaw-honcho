@@ -98,16 +98,21 @@ export async function loadIdentityContext(
     timeoutMs = 5000,
   } = config;
 
-  // Race all layer loading against a timeout to keep chat responsive.
-  // If the timeout fires, we return whatever we have so far.
-  const result = await Promise.race([
-    loadLayers(ownerPeer, alignmentQueries, representationQuery, maxConclusions, searchTopK),
-    new Promise<{ peerCard: string[] | null; alignmentResponses: string[]; representation: string | null }>(
-      (resolve) => setTimeout(() => resolve({ peerCard: null, alignmentResponses: [], representation: null }), timeoutMs),
-    ),
+  // Shared accumulator: layers write results as they resolve.
+  // If the timeout fires, we get whatever layers completed in time
+  // instead of discarding fast layers when a slow one (e.g., chat) hangs.
+  const partial: { peerCard: string[] | null; alignmentResponses: string[]; representation: string | null } = {
+    peerCard: null,
+    alignmentResponses: [],
+    representation: null,
+  };
+
+  await Promise.race([
+    loadLayers(ownerPeer, alignmentQueries, representationQuery, maxConclusions, searchTopK, partial),
+    new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
   ]);
 
-  let { peerCard, alignmentResponses, representation } = result;
+  let { peerCard, alignmentResponses, representation } = partial;
 
   // Apply safety filter to Layer 3
   if (representation && safetyPatterns !== undefined) {
@@ -124,45 +129,43 @@ export async function loadIdentityContext(
   return { peerCard, alignmentResponses, representation, systemPrompt };
 }
 
-/** Internal: load all three layers concurrently. */
+/** Internal: load all three layers concurrently, writing results into `out` as they arrive. */
 async function loadLayers(
   ownerPeer: Peer,
   alignmentQueries: string[],
   representationQuery: string | undefined,
   maxConclusions: number,
   searchTopK: number,
-): Promise<{ peerCard: string[] | null; alignmentResponses: string[]; representation: string | null }> {
-  // Run all three layers concurrently -- they're independent
-  const [cardResult, chatResults, reprResult] = await Promise.allSettled([
+  out: { peerCard: string[] | null; alignmentResponses: string[]; representation: string | null },
+): Promise<void> {
+  // Run all three layers concurrently -- they're independent.
+  // Each layer writes into `out` on success so that a timeout collects
+  // whatever resolved in time (e.g., fast card + slow chat → card preserved).
+  await Promise.allSettled([
     // Layer 1
-    ownerPeer.getCard(),
+    ownerPeer.getCard()
+      .then((v) => { out.peerCard = v; })
+      .catch(() => {}),
     // Layer 2
     alignmentQueries.length > 0
       ? Promise.allSettled(alignmentQueries.map((q) => ownerPeer.chat(q)))
-      : Promise.resolve([]),
+          .then((results) => {
+            for (const r of results) {
+              if (r.status === "fulfilled" && r.value) {
+                out.alignmentResponses.push(r.value);
+              }
+            }
+          })
+      : Promise.resolve(),
     // Layer 3
     ownerPeer.representation({
       ...(representationQuery ? { searchQuery: representationQuery, searchTopK } : {}),
       includeMostFrequent: true,
       maxConclusions,
-    }),
+    })
+      .then((v) => { out.representation = v; })
+      .catch(() => {}),
   ]);
-
-  const peerCard = cardResult.status === "fulfilled" ? cardResult.value : null;
-
-  const alignmentResponses: string[] = [];
-  if (chatResults.status === "fulfilled") {
-    const settled = chatResults.value as PromiseSettledResult<string | null>[];
-    for (const r of settled) {
-      if (r.status === "fulfilled" && r.value) {
-        alignmentResponses.push(r.value);
-      }
-    }
-  }
-
-  const representation = reprResult.status === "fulfilled" ? reprResult.value : null;
-
-  return { peerCard, alignmentResponses, representation };
 }
 
 // ============================================================================
