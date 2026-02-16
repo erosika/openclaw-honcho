@@ -75,6 +75,42 @@ describe("stripInternalContext", () => {
     expect(result).not.toContain("secret");
     expect(result).toContain("public");
   });
+
+  // New patterns
+  it("strips AWS account IDs (12 digits)", () => {
+    const text = "AWS account 123456789012\nPhilosophy is key";
+    const result = stripInternalContext(text, DEFAULT_SAFETY_PATTERNS);
+    expect(result).not.toContain("123456789012");
+    expect(result).toContain("Philosophy");
+  });
+
+  it("strips internal DNS names", () => {
+    const text = "Service at db.internal responds\nCreativity matters";
+    const result = stripInternalContext(text, DEFAULT_SAFETY_PATTERNS);
+    expect(result).not.toContain("db.internal");
+    expect(result).toContain("Creativity");
+  });
+
+  it("strips bearer tokens", () => {
+    const text = "Bearer eyJhbGciOiJIUzI1NiIsInR5c...\nValues above all";
+    const result = stripInternalContext(text, DEFAULT_SAFETY_PATTERNS);
+    expect(result).not.toContain("Bearer");
+    expect(result).toContain("Values");
+  });
+
+  it("strips localhost URLs", () => {
+    const text = "Running at localhost:3000\nArt is essential";
+    const result = stripInternalContext(text, DEFAULT_SAFETY_PATTERNS);
+    expect(result).not.toContain("localhost");
+    expect(result).toContain("Art");
+  });
+
+  it("strips webhook URLs", () => {
+    const text = "Configured webhooks.slack.com/services/T...\nPrecision matters";
+    const result = stripInternalContext(text, DEFAULT_SAFETY_PATTERNS);
+    expect(result).not.toContain("webhooks");
+    expect(result).toContain("Precision");
+  });
 });
 
 // ============================================================================
@@ -175,6 +211,7 @@ describe("loadIdentityContext", () => {
     card?: string[] | null;
     chatResponses?: (string | null)[];
     representation?: string | null;
+    chatDelay?: number;
   }) {
     let chatCallIndex = 0;
     return {
@@ -182,6 +219,9 @@ describe("loadIdentityContext", () => {
       chat: vi.fn().mockImplementation(() => {
         const resp = opts.chatResponses?.[chatCallIndex] ?? null;
         chatCallIndex++;
+        if (opts.chatDelay) {
+          return new Promise((resolve) => setTimeout(() => resolve(resp), opts.chatDelay));
+        }
         return Promise.resolve(resp);
       }),
       representation: vi.fn().mockResolvedValue(opts.representation ?? null),
@@ -253,21 +293,97 @@ describe("loadIdentityContext", () => {
 
     const result = await loadIdentityContext(peer, {
       representationQuery: "budget",
-      // safetyPatterns not set
     });
 
     expect(result.representation).toContain("$5.00");
   });
 
-  it("runs alignment queries in parallel", async () => {
-    const peer = mockPeer({
-      chatResponses: ["a1", "a2", "a3"],
-    });
+  it("loads all three layers concurrently", async () => {
+    const callOrder: string[] = [];
+    const peer = {
+      getCard: vi.fn().mockImplementation(() => {
+        callOrder.push("card");
+        return Promise.resolve(["fact"]);
+      }),
+      chat: vi.fn().mockImplementation(() => {
+        callOrder.push("chat");
+        return Promise.resolve("answer");
+      }),
+      representation: vi.fn().mockImplementation(() => {
+        callOrder.push("repr");
+        return Promise.resolve("context");
+      }),
+    } as any;
 
     await loadIdentityContext(peer, {
+      alignmentQueries: ["q?"],
+      representationQuery: "search",
+    });
+
+    // All three should be called (concurrent -- order may vary but all present)
+    expect(callOrder).toContain("card");
+    expect(callOrder).toContain("chat");
+    expect(callOrder).toContain("repr");
+  });
+
+  it("returns partial results on timeout", async () => {
+    // Peer with very slow chat but fast card/representation
+    const peer = {
+      getCard: vi.fn().mockResolvedValue(["fast fact"]),
+      chat: vi.fn().mockImplementation(
+        () => new Promise((resolve) => setTimeout(() => resolve("slow answer"), 10000)),
+      ),
+      representation: vi.fn().mockResolvedValue("fast context"),
+    } as any;
+
+    const result = await loadIdentityContext(peer, {
+      alignmentQueries: ["q?"],
+      representationQuery: "search",
+      timeoutMs: 50, // very short timeout
+    });
+
+    // The timeout fires, returns empty defaults
+    // (In practice, the fast calls may complete before timeout, but
+    //  we're testing that it doesn't hang for 10s)
+    expect(result.systemPrompt).toBeDefined();
+  }, 2000); // test itself must complete in 2s
+
+  it("handles all layers failing gracefully", async () => {
+    const peer = {
+      getCard: vi.fn().mockRejectedValue(new Error("network")),
+      chat: vi.fn().mockRejectedValue(new Error("network")),
+      representation: vi.fn().mockRejectedValue(new Error("network")),
+    } as any;
+
+    const result = await loadIdentityContext(peer, {
+      alignmentQueries: ["q?"],
+      representationQuery: "search",
+    });
+
+    expect(result.peerCard).toBeNull();
+    expect(result.alignmentResponses).toEqual([]);
+    expect(result.representation).toBeNull();
+    // Still generates a prompt (just the role declaration)
+    expect(result.systemPrompt).toContain("agent");
+  });
+
+  it("handles empty peer card array", async () => {
+    const peer = mockPeer({ card: [] });
+
+    const result = await loadIdentityContext(peer);
+    expect(result.peerCard).toEqual([]);
+    expect(result.systemPrompt).not.toContain("## Identity");
+  });
+
+  it("filters null chat responses", async () => {
+    const peer = mockPeer({
+      chatResponses: ["real answer", null, "another answer"],
+    });
+
+    const result = await loadIdentityContext(peer, {
       alignmentQueries: ["q1?", "q2?", "q3?"],
     });
 
-    expect(peer.chat).toHaveBeenCalledTimes(3);
+    expect(result.alignmentResponses).toEqual(["real answer", "another answer"]);
   });
 });

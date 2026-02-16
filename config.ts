@@ -20,6 +20,9 @@ export type HonchoConfig = {
   enableSafetyFilter?: boolean;
   enableOutboundScanning?: boolean;
 
+  // Performance
+  identityTimeoutMs?: number;
+
   // Dream triggers
   dreamAfterConversations?: number;
 };
@@ -89,6 +92,12 @@ export const honchoConfigSchema = {
         || process.env.HONCHO_SAFETY_FILTER === "true",
       enableOutboundScanning: cfg.enableOutboundScanning === true
         || process.env.HONCHO_OUTBOUND_SCANNING === "true",
+
+      // Performance
+      identityTimeoutMs:
+        typeof cfg.identityTimeoutMs === "number" ? cfg.identityTimeoutMs
+          : process.env.HONCHO_IDENTITY_TIMEOUT ? parseInt(process.env.HONCHO_IDENTITY_TIMEOUT, 10)
+          : undefined,
 
       // Dreams
       dreamAfterConversations:

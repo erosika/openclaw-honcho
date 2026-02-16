@@ -2,8 +2,58 @@ import { describe, it, expect } from "vitest";
 import {
   scanOutbound,
   redactOutbound,
+  stripCodeBlocks,
   DEFAULT_SCAN_PATTERNS,
 } from "../scanning.js";
+
+// ============================================================================
+// stripCodeBlocks
+// ============================================================================
+
+describe("stripCodeBlocks", () => {
+  it("strips fenced code blocks", () => {
+    const text = "Here's an example:\n```\nexport API_KEY=secret123\n```\nDone!";
+    const result = stripCodeBlocks(text);
+    expect(result).not.toContain("API_KEY=secret123");
+    expect(result).toContain("Here's an example:");
+    expect(result).toContain("Done!");
+  });
+
+  it("strips fenced code blocks with language tags", () => {
+    const text = "Example:\n```bash\nexport TOKEN=abc\n```";
+    const result = stripCodeBlocks(text);
+    expect(result).not.toContain("TOKEN=abc");
+  });
+
+  it("strips inline code", () => {
+    const text = "Set `API_KEY=your_key` in the env";
+    const result = stripCodeBlocks(text);
+    expect(result).not.toContain("API_KEY=your_key");
+    expect(result).toContain("Set ");
+    expect(result).toContain(" in the env");
+  });
+
+  it("strips multiple code blocks", () => {
+    const text = "First `code1`, then:\n```\ncode2\n```\nand `code3`";
+    const result = stripCodeBlocks(text);
+    expect(result).not.toContain("code1");
+    expect(result).not.toContain("code2");
+    expect(result).not.toContain("code3");
+  });
+
+  it("preserves text without code blocks", () => {
+    const text = "No code here, just plain text.";
+    expect(stripCodeBlocks(text)).toBe(text);
+  });
+
+  it("handles empty string", () => {
+    expect(stripCodeBlocks("")).toBe("");
+  });
+});
+
+// ============================================================================
+// scanOutbound
+// ============================================================================
 
 describe("scanOutbound", () => {
   it("passes clean text", () => {
@@ -30,6 +80,12 @@ describe("scanOutbound", () => {
     expect(result.findings[0].pattern).toBe("env-secret");
   });
 
+  it("blocks bearer tokens", () => {
+    const result = scanOutbound("Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.abc");
+    expect(result.safe).toBe(false);
+    expect(result.findings.some((f) => f.pattern === "bearer-token")).toBe(true);
+  });
+
   it("blocks system paths", () => {
     const result = scanOutbound("The config is at /Users/eri/Documents/config.json");
     expect(result.safe).toBe(false);
@@ -52,6 +108,13 @@ describe("scanOutbound", () => {
     const result = scanOutbound("Running on localhost:3000");
     expect(result.safe).toBe(false);
     expect(result.findings[0].pattern).toBe("internal-port");
+  });
+
+  it("warns on internal DNS but stays safe", () => {
+    const result = scanOutbound("Service at db.internal is healthy");
+    expect(result.safe).toBe(true);
+    expect(result.findings.some((f) => f.pattern === "internal-dns")).toBe(true);
+    expect(result.findings[0].severity).toBe("warn");
   });
 
   it("warns on email addresses but stays safe", () => {
@@ -100,7 +163,39 @@ describe("scanOutbound", () => {
     const result = scanOutbound("");
     expect(result.safe).toBe(true);
   });
+
+  // Code block exemption tests
+  it("ignores secrets inside fenced code blocks", () => {
+    const text = "Here's how to set it up:\n```\nexport API_KEY=your_secret_here\n```\nThat's it!";
+    const result = scanOutbound(text);
+    expect(result.safe).toBe(true);
+  });
+
+  it("ignores secrets inside inline code", () => {
+    const text = "Run `export TOKEN=abc123` to configure";
+    const result = scanOutbound(text);
+    // The inline code is stripped, so TOKEN=abc123 shouldn't be scanned
+    expect(result.findings.filter((f) => f.pattern === "env-secret")).toEqual([]);
+  });
+
+  it("still catches secrets outside code blocks", () => {
+    const text = "Run this:\n```\necho hello\n```\nAlso set API_KEY=real_secret_value";
+    const result = scanOutbound(text);
+    expect(result.safe).toBe(false);
+    expect(result.findings.some((f) => f.pattern === "env-secret")).toBe(true);
+  });
+
+  it("handles mixed code blocks and real secrets", () => {
+    const text = "Example: `export FOO=bar`\n\nBut the real key is sk-abc123def456ghi789jkl012mno345";
+    const result = scanOutbound(text);
+    expect(result.safe).toBe(false); // real API key outside code
+    expect(result.findings.some((f) => f.pattern === "api-key")).toBe(true);
+  });
 });
+
+// ============================================================================
+// redactOutbound
+// ============================================================================
 
 describe("redactOutbound", () => {
   it("redacts API keys", () => {
@@ -125,5 +220,10 @@ describe("redactOutbound", () => {
   it("leaves clean text unchanged", () => {
     const text = "Hello, how are you today?";
     expect(redactOutbound(text)).toBe(text);
+  });
+
+  it("redacts bearer tokens", () => {
+    const result = redactOutbound("Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6");
+    expect(result).not.toContain("eyJhbGci");
   });
 });

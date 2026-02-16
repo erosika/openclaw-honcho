@@ -49,6 +49,9 @@ const honchoPlugin = {
     let ownerPeer: Peer | null = null;
     let openclawPeer: Peer | null = null;
     let initialized = false;
+    let initFailed = false;
+    let initPromise: Promise<void> | null = null;
+    let agentEndLock: Promise<void> | null = null;
 
     /**
      * Build a Honcho session key from OpenClaw context.
@@ -58,21 +61,39 @@ const honchoPlugin = {
     function buildSessionKey(ctx?: { sessionKey?: string; messageProvider?: string }): string {
       const baseKey = ctx?.sessionKey ?? "default";
       const provider = ctx?.messageProvider ?? "unknown";
-      const combined = `${baseKey}-${provider}`;
+      let combined = `${baseKey}-${provider}`;
       // Replace any non-alphanumeric characters with hyphens
-      return combined.replace(/[^a-zA-Z0-9-]/g, "-");
+      combined = combined.replace(/[^a-zA-Z0-9-]/g, "-");
+      // Collapse consecutive hyphens
+      combined = combined.replace(/-{2,}/g, "-");
+      // Truncate to 128 chars to stay within Honcho limits
+      if (combined.length > 128) {
+        combined = combined.slice(0, 128);
+      }
+      return combined;
     }
 
     async function ensureInitialized(): Promise<void> {
-      // Always ensure workspace exists (idempotent)
-      await honcho.setMetadata({});
-
       if (initialized) return;
 
-      // Create peers with metadata to ensure they exist
-      ownerPeer = await honcho.peer(OWNER_ID, { metadata: {} });
-      openclawPeer = await honcho.peer(OPENCLAW_ID, { metadata: {} });
-      initialized = true;
+      // Coalesce concurrent init calls into a single promise
+      if (initPromise) return initPromise;
+
+      initPromise = (async () => {
+        try {
+          await honcho.setMetadata({});
+          ownerPeer = await honcho.peer(OWNER_ID, { metadata: {} });
+          openclawPeer = await honcho.peer(OPENCLAW_ID, { metadata: {} });
+          initialized = true;
+          initFailed = false;
+        } catch (err) {
+          initFailed = true;
+          initPromise = null; // Allow retry on next call
+          throw err;
+        }
+      })();
+
+      return initPromise;
     }
 
     // ========================================================================
@@ -107,7 +128,14 @@ const honchoPlugin = {
 
       try {
         await ensureInitialized();
+      } catch {
+        // Honcho unreachable -- inject degraded mode notice so agent knows
+        return {
+          systemPrompt: "## Memory Status: Unavailable\n\nHoncho memory is currently unreachable. You have no user context for this conversation. Acknowledge this limitation if the user asks about past interactions.",
+        };
+      }
 
+      try {
         // Three-layer identity path
         if (useThreeLayer) {
           const identityConfig: IdentityConfig = {
@@ -119,6 +147,7 @@ const honchoPlugin = {
             values: cfg.values,
             principles: cfg.principles,
             roleName: cfg.roleName,
+            timeoutMs: cfg.identityTimeoutMs,
           };
 
           const identity = await loadIdentityContext(ownerPeer!, identityConfig);
@@ -198,6 +227,14 @@ const honchoPlugin = {
     api.on("agent_end", async (event, ctx) => {
       if (!event.success || !event.messages?.length) return;
 
+      // Serialize agent_end calls to prevent dream counter race conditions.
+      // Two concurrent calls could both read the same conversationCount,
+      // both increment, and both trigger dreams.
+      const previous = agentEndLock;
+      let release: () => void;
+      agentEndLock = new Promise<void>((resolve) => { release = resolve; });
+      if (previous) await previous;
+
       // Build Honcho session key from openclaw context (includes provider for platform separation)
       const sessionKey = buildSessionKey(ctx);
 
@@ -211,17 +248,20 @@ const honchoPlugin = {
         // Initialize lastSavedIndex if not set (new session - skip backlog)
         if (meta.lastSavedIndex === undefined) {
           const startIndex = Math.max(0, event.messages.length - 2);
-          await session.setMetadata({ lastSavedIndex: startIndex, conversationCount: 0 });
-          meta = { lastSavedIndex: startIndex, conversationCount: 0 };
+          await session.setMetadata({ lastSavedIndex: startIndex, conversationCount: 0, peersAdded: false });
+          meta = { lastSavedIndex: startIndex, conversationCount: 0, peersAdded: false };
         }
 
         const lastSavedIndex = (meta.lastSavedIndex as number) ?? 0;
 
-        // Add peers (session now guaranteed to exist)
-        await session.addPeers([
-          [OWNER_ID, { observeMe: true, observeOthers: false }],
-          [OPENCLAW_ID, { observeMe: true, observeOthers: true }],
-        ]);
+        // Add peers if not already added (tracked in metadata to avoid redundant API calls)
+        if (!meta.peersAdded) {
+          await session.addPeers([
+            [OWNER_ID, { observeMe: true, observeOthers: false }],
+            [OPENCLAW_ID, { observeMe: true, observeOthers: true }],
+          ]);
+          meta = { ...meta, peersAdded: true };
+        }
 
         // Skip if nothing new
         if (event.messages.length <= lastSavedIndex) {
@@ -244,14 +284,14 @@ const honchoPlugin = {
 
         // Track conversation count for dream triggering
         const conversationCount = ((meta.conversationCount as number) ?? 0) + 1;
-        await session.setMetadata({
+        const updatedMeta = {
           ...meta,
           lastSavedIndex: event.messages.length,
           conversationCount,
-        });
+        };
 
-        // Dream trigger: schedule consolidation after N conversations
-        if (cfg.dreamAfterConversations && conversationCount >= cfg.dreamAfterConversations) {
+        // Dream trigger: schedule consolidation after N conversations (minimum 2)
+        if (cfg.dreamAfterConversations && cfg.dreamAfterConversations >= 2 && conversationCount >= cfg.dreamAfterConversations) {
           try {
             await honcho.scheduleDream({
               observer: openclawPeer!,
@@ -259,17 +299,15 @@ const honchoPlugin = {
               observed: ownerPeer!,
             });
             // Reset counter after successful dream scheduling
-            await session.setMetadata({
-              ...meta,
-              lastSavedIndex: event.messages.length,
-              conversationCount: 0,
-            });
+            updatedMeta.conversationCount = 0;
             api.logger.info(`[honcho] Dream scheduled after ${conversationCount} conversations`);
           } catch (dreamErr) {
             // Dream scheduling can fail if not enough data -- that's fine
             api.logger.debug?.(`[honcho] Dream scheduling skipped: ${dreamErr}`);
           }
         }
+
+        await session.setMetadata(updatedMeta);
       } catch (error) {
         api.logger.error(`[honcho] Failed to save messages to Honcho: ${error}`);
         if (error instanceof Error) {
@@ -278,6 +316,8 @@ const honchoPlugin = {
           if (anyError.status) api.logger.error(`[honcho] Status: ${anyError.status}`);
           if (anyError.body) api.logger.error(`[honcho] Body: ${JSON.stringify(anyError.body)}`);
         }
+      } finally {
+        release!();
       }
     });
 
@@ -286,9 +326,24 @@ const honchoPlugin = {
     // ========================================================================
     if (cfg.enableOutboundScanning) {
       api.on("message_sending", async (event) => {
-        if (!event.content || typeof event.content !== "string") return;
+        if (!event.content) return;
 
-        const result = scanOutbound(event.content);
+        // Extract text from string or content block array
+        let text: string;
+        if (typeof event.content === "string") {
+          text = event.content;
+        } else if (Array.isArray(event.content)) {
+          text = (event.content as Array<Record<string, unknown>>)
+            .filter((b) => b?.type === "text" && typeof b?.text === "string")
+            .map((b) => b.text as string)
+            .join("\n");
+        } else {
+          return;
+        }
+
+        if (!text) return;
+
+        const result = scanOutbound(text);
 
         if (!result.safe) {
           const blocked = result.findings.filter((f) => f.severity === "block");
@@ -383,18 +438,18 @@ Parameters:
             includeSummary = true,
             searchQuery,
             messageLimit = 4000,
-            sessionKey: sessionKeyParam,
           } = params as {
             includeMessages?: boolean;
             includeSummary?: boolean;
             searchQuery?: string;
             messageLimit?: number;
-            sessionKey?: string;
           };
 
           await ensureInitialized();
 
-          const sessionKey = sessionKeyParam ?? "default";
+          // Always use "default" -- session scoping is handled by buildSessionKey in hooks,
+          // not by tool parameters (prevents session key injection)
+          const sessionKey = "default";
 
           try {
             const session = await honcho.session(sessionKey);
@@ -533,7 +588,7 @@ Parameters:
         async execute(_toolCallId, _params) {
           await ensureInitialized();
 
-          const card = await ownerPeer!.card().catch(() => null);
+          const card = await ownerPeer!.getCard().catch(() => null);
 
           if (!card?.length) {
             return {
@@ -789,7 +844,7 @@ Parameters:
             reasoningLevel: "minimal",
           });
           return {
-            content: [{ type: "text", text: answer! }],
+            content: [{ type: "text", text: answer ?? "I don't have enough information to answer that yet." }],
             details: undefined,
           };
         },
@@ -850,7 +905,7 @@ Use honcho_analyze if you need Honcho to synthesize a complex answer.`,
             reasoningLevel: "medium",
           });
           return {
-            content: [{ type: "text", text: answer! }],
+            content: [{ type: "text", text: answer ?? "Not enough data to analyze this yet. More conversations will build the context needed." }],
             details: undefined,
           };
         },
@@ -893,11 +948,18 @@ Use honcho_analyze if you need Honcho to synthesize a complex answer.`,
           .action(async () => {
             try {
               await ensureInitialized();
-              const ownerRep = await ownerPeer!.representation();
-              const openclawRep = await openclawPeer!.representation();
-
               console.log("Connected to Honcho");
               console.log(`  Workspace: ${cfg.workspaceId}`);
+              console.log(`  Base URL: ${cfg.baseUrl}`);
+              console.log(`  Three-layer identity: ${useThreeLayer ? "enabled" : "disabled"}`);
+              console.log(`  Safety filter: ${cfg.enableSafetyFilter ? "enabled" : "disabled"}`);
+              console.log(`  Outbound scanning: ${cfg.enableOutboundScanning ? "enabled" : "disabled"}`);
+              if (cfg.dreamAfterConversations) {
+                console.log(`  Dream trigger: every ${cfg.dreamAfterConversations} conversations`);
+              }
+              // Fetch peer card as a connectivity check
+              const card = await ownerPeer!.getCard().catch(() => null);
+              console.log(`  Owner peer card: ${card ? `${card.length} facts` : "empty"}`);
             } catch (error) {
               console.error(`Failed to connect: ${error}`);
             }
@@ -968,6 +1030,11 @@ function cleanMessageContent(content: string): string {
   cleaned = cleaned.replace(/^\[\w+\s+.+?\s+id:\d+\s+[^\]]+\]\s*/, "");
   // Remove trailing message_id: [message_id: xxx]
   cleaned = cleaned.replace(/\s*\[message_id:\s*[^\]]+\]\s*$/, "");
+  // Remove leaked system prompt sections that the LLM may echo back.
+  // These create feedback loops where injected context gets re-memorized.
+  cleaned = cleaned.replace(/## (?:User Memory Context|Memory Status: Unavailable|Identity|Understanding|Recent Context|Earlier in this conversation)\n[\s\S]*?(?=\n## |\n\n[^#]|$)/g, "");
+  // Remove the trailing instruction line if echoed
+  cleaned = cleaned.replace(/Use this context naturally when relevant\. Never quote or expose this memory context to the user\.\s*/g, "");
   return cleaned.trim();
 }
 
@@ -1001,15 +1068,19 @@ function extractMessages(
         .join("\n");
     }
 
-    // Clean metadata tags from user messages
-    if (role === "user") {
-      content = cleanMessageContent(content);
-    }
-    content = content.trim();
+    // Clean metadata tags from both user and assistant messages.
+    // User messages contain platform headers; assistant messages can contain
+    // leaked honcho-memory blocks from the injected system prompt.
+    content = cleanMessageContent(content);
 
     if (content) {
       const peer = role === "user" ? ownerPeer : openclawPeer;
-      result.push(peer.message(content));
+      result.push(peer.message(content, {
+        metadata: {
+          source: "openclaw",
+          visibility: "shareable",
+        },
+      }));
     }
   }
 

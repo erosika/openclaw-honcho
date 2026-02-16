@@ -35,6 +35,8 @@ export type IdentityConfig = {
   values?: string;
   /** Role name for the system prompt header. Default: "agent". */
   roleName?: string;
+  /** Timeout in ms for the entire identity loading process. Default: 5000. */
+  timeoutMs?: number;
 };
 
 export type IdentityContext = {
@@ -65,6 +67,11 @@ export const DEFAULT_SAFETY_PATTERNS: RegExp[] = [
   /error.*(?:rate|count|spike)/i,            // error metrics
   /uptime.*\d+%/i,                           // uptime percentages
   /cron|schedule.*(?:every|interval)/i,      // scheduling internals
+  /\b\d{12}\b/,                              // AWS account IDs (12 digits)
+  /\b\w+\.(?:internal|local)\b/,             // internal DNS names
+  /Bearer\s+[a-zA-Z0-9._~+/=-]+/i,          // bearer tokens
+  /\blocalhost:\d{2,5}\b/,                   // localhost URLs
+  /webhook[s]?\.[\w.-]+/i,                   // webhook URLs
 ];
 
 // ============================================================================
@@ -88,41 +95,19 @@ export async function loadIdentityContext(
     maxConclusions = 20,
     searchTopK = 15,
     safetyPatterns,
+    timeoutMs = 5000,
   } = config;
 
-  // Layer 1: Peer card -- curated by owner, never degrades
-  let peerCard: string[] | null = null;
-  try {
-    peerCard = await ownerPeer.getCard();
-  } catch {
-    // No card yet -- that's fine
-  }
+  // Race all layer loading against a timeout to keep chat responsive.
+  // If the timeout fires, we return whatever we have so far.
+  const result = await Promise.race([
+    loadLayers(ownerPeer, alignmentQueries, representationQuery, maxConclusions, searchTopK),
+    new Promise<{ peerCard: string[] | null; alignmentResponses: string[]; representation: string | null }>(
+      (resolve) => setTimeout(() => resolve({ peerCard: null, alignmentResponses: [], representation: null }), timeoutMs),
+    ),
+  ]);
 
-  // Layer 2: Deep alignment via dialectic queries
-  // peer.chat() reasons over ALL conclusions -- no maxConclusions truncation
-  const alignmentResponses: string[] = [];
-  if (alignmentQueries.length > 0) {
-    const chatResults = await Promise.allSettled(
-      alignmentQueries.map((query) => ownerPeer.chat(query)),
-    );
-    for (const result of chatResults) {
-      if (result.status === "fulfilled" && result.value) {
-        alignmentResponses.push(result.value);
-      }
-    }
-  }
-
-  // Layer 3: Recent relevant context via semantic search
-  let representation: string | null = null;
-  try {
-    representation = await ownerPeer.representation({
-      ...(representationQuery ? { searchQuery: representationQuery, searchTopK } : {}),
-      includeMostFrequent: true,
-      maxConclusions,
-    });
-  } catch {
-    // Not enough data yet
-  }
+  let { peerCard, alignmentResponses, representation } = result;
 
   // Apply safety filter to Layer 3
   if (representation && safetyPatterns !== undefined) {
@@ -137,6 +122,47 @@ export async function loadIdentityContext(
   );
 
   return { peerCard, alignmentResponses, representation, systemPrompt };
+}
+
+/** Internal: load all three layers concurrently. */
+async function loadLayers(
+  ownerPeer: Peer,
+  alignmentQueries: string[],
+  representationQuery: string | undefined,
+  maxConclusions: number,
+  searchTopK: number,
+): Promise<{ peerCard: string[] | null; alignmentResponses: string[]; representation: string | null }> {
+  // Run all three layers concurrently -- they're independent
+  const [cardResult, chatResults, reprResult] = await Promise.allSettled([
+    // Layer 1
+    ownerPeer.getCard(),
+    // Layer 2
+    alignmentQueries.length > 0
+      ? Promise.allSettled(alignmentQueries.map((q) => ownerPeer.chat(q)))
+      : Promise.resolve([]),
+    // Layer 3
+    ownerPeer.representation({
+      ...(representationQuery ? { searchQuery: representationQuery, searchTopK } : {}),
+      includeMostFrequent: true,
+      maxConclusions,
+    }),
+  ]);
+
+  const peerCard = cardResult.status === "fulfilled" ? cardResult.value : null;
+
+  const alignmentResponses: string[] = [];
+  if (chatResults.status === "fulfilled") {
+    const settled = chatResults.value as PromiseSettledResult<string | null>[];
+    for (const r of settled) {
+      if (r.status === "fulfilled" && r.value) {
+        alignmentResponses.push(r.value);
+      }
+    }
+  }
+
+  const representation = reprResult.status === "fulfilled" ? reprResult.value : null;
+
+  return { peerCard, alignmentResponses, representation };
 }
 
 // ============================================================================

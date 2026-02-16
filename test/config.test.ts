@@ -154,4 +154,40 @@ describe("honchoConfigSchema.parse", () => {
     const cfg = honchoConfigSchema.parse({ apiKey: "${MY_HONCHO_KEY}" });
     expect(cfg.apiKey).toBe("hc_resolved");
   });
+
+  it("parses identityTimeoutMs from config", () => {
+    const cfg = honchoConfigSchema.parse({ identityTimeoutMs: 3000 });
+    expect(cfg.identityTimeoutMs).toBe(3000);
+  });
+
+  it("parses identityTimeoutMs from env", () => {
+    process.env.HONCHO_IDENTITY_TIMEOUT = "2000";
+    const cfg = honchoConfigSchema.parse({});
+    expect(cfg.identityTimeoutMs).toBe(2000);
+  });
+
+  it("returns undefined for identityTimeoutMs when not set", () => {
+    const cfg = honchoConfigSchema.parse({});
+    expect(cfg.identityTimeoutMs).toBeUndefined();
+  });
+
+  it("parses NaN HONCHO_DREAM_AFTER as NaN", () => {
+    process.env.HONCHO_DREAM_AFTER = "not_a_number";
+    const cfg = honchoConfigSchema.parse({});
+    // parseInt("not_a_number") returns NaN
+    expect(cfg.dreamAfterConversations).toBeNaN();
+  });
+
+  it("handles empty HONCHO_ALIGNMENT_QUERIES", () => {
+    process.env.HONCHO_ALIGNMENT_QUERIES = "";
+    const cfg = honchoConfigSchema.parse({});
+    // Empty string is falsy, parseEnvArray returns undefined
+    expect(cfg.alignmentQueries).toBeUndefined();
+  });
+
+  it("trims whitespace from pipe-delimited arrays", () => {
+    process.env.HONCHO_PRINCIPLES = " Be precise. | Strip non-essential. ";
+    const cfg = honchoConfigSchema.parse({});
+    expect(cfg.principles).toEqual(["Be precise.", "Strip non-essential."]);
+  });
 });
