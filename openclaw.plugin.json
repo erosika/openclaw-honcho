@@ -16,6 +16,52 @@
       "baseUrl": {
         "type": "string",
         "default": "https://api.honcho.dev"
+      },
+      "alignmentQueries": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Dialectic questions for Layer 2 deep alignment (or set HONCHO_ALIGNMENT_QUERIES pipe-delimited)"
+      },
+      "representationQuery": {
+        "type": "string",
+        "description": "Semantic search query for Layer 3 recent context (or set HONCHO_REPRESENTATION_QUERY)"
+      },
+      "maxConclusions": {
+        "type": "number",
+        "default": 20,
+        "description": "Max conclusions for Layer 3 representation"
+      },
+      "searchTopK": {
+        "type": "number",
+        "default": 15,
+        "description": "Top-K for Layer 3 semantic search"
+      },
+      "values": {
+        "type": "string",
+        "description": "Values statement injected into identity prompt (or set HONCHO_VALUES)"
+      },
+      "principles": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Operating principles injected into identity prompt (or set HONCHO_PRINCIPLES pipe-delimited)"
+      },
+      "roleName": {
+        "type": "string",
+        "description": "Role name for the system prompt header (or set HONCHO_ROLE_NAME)"
+      },
+      "enableSafetyFilter": {
+        "type": "boolean",
+        "default": false,
+        "description": "Strip internal/operational context from Layer 3 before injection"
+      },
+      "enableOutboundScanning": {
+        "type": "boolean",
+        "default": false,
+        "description": "Scan outbound messages for PII and secrets before sending"
+      },
+      "dreamAfterConversations": {
+        "type": "number",
+        "description": "Trigger a Honcho dream cycle after N conversations (or set HONCHO_DREAM_AFTER)"
       }
     }
   },
@@ -35,6 +81,46 @@
       "label": "API Base URL",
       "advanced": true,
       "placeholder": "https://api.honcho.dev"
+    },
+    "alignmentQueries": {
+      "label": "Alignment Queries",
+      "advanced": true,
+      "help": "Questions asked via peer.chat() for deep identity alignment"
+    },
+    "representationQuery": {
+      "label": "Representation Query",
+      "advanced": true,
+      "help": "Semantic search terms for recent context scoping"
+    },
+    "values": {
+      "label": "Values",
+      "advanced": true,
+      "help": "Values statement for the agent's identity"
+    },
+    "principles": {
+      "label": "Principles",
+      "advanced": true,
+      "help": "Operating principles for the agent"
+    },
+    "roleName": {
+      "label": "Role Name",
+      "advanced": true,
+      "help": "How the agent identifies itself (e.g., 'communicator agent')"
+    },
+    "enableSafetyFilter": {
+      "label": "Safety Filter",
+      "advanced": true,
+      "help": "Remove operational details from injected context"
+    },
+    "enableOutboundScanning": {
+      "label": "Outbound Scanning",
+      "advanced": true,
+      "help": "Scan outbound messages for secrets and PII"
+    },
+    "dreamAfterConversations": {
+      "label": "Dream Interval",
+      "advanced": true,
+      "help": "Trigger memory consolidation every N conversations"
     }
   }
 }

@@ -13,6 +13,14 @@
     "./config": {
       "types": "./dist/config.d.ts",
       "import": "./dist/config.js"
+    },
+    "./identity": {
+      "types": "./dist/identity.d.ts",
+      "import": "./dist/identity.js"
+    },
+    "./scanning": {
+      "types": "./dist/scanning.d.ts",
+      "import": "./dist/scanning.js"
     }
   },
   "files": [

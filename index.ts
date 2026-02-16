@@ -10,6 +10,8 @@ import { Honcho, type Peer, type Session, type MessageInput } from "@honcho-ai/s
 // @ts-ignore - resolved by openclaw runtime
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { honchoConfigSchema, type HonchoConfig } from "./config.js";
+import { loadIdentityContext, DEFAULT_SAFETY_PATTERNS, type IdentityConfig } from "./identity.js";
+import { scanOutbound, DEFAULT_SCAN_PATTERNS, type ScanPattern } from "./scanning.js";
 
 // ============================================================================
 // Constants
@@ -87,21 +89,70 @@ const honchoPlugin = {
     });
 
     // ========================================================================
-    // HOOK: before_agent_start — Inject Honcho context into system prompt
+    // HOOK: before_agent_start — Three-layer identity injection
     // ========================================================================
+    //
+    // When alignmentQueries are configured, uses three-layer identity:
+    //   Layer 1: peer.getCard() — curated facts, stable anchor
+    //   Layer 2: peer.chat(query) — dialectic synthesis over ALL conclusions
+    //   Layer 3: peer.representation({searchQuery}) — recent, role-scoped
+    //
+    // Otherwise, falls back to the original flat session.context() approach.
+    //
+    const useThreeLayer = !!(cfg.alignmentQueries?.length || cfg.representationQuery || cfg.values || cfg.principles?.length);
+
     api.on("before_agent_start", async (event, ctx) => {
       // Skip if no meaningful prompt
       if (!event.prompt || event.prompt.length < 5) return;
 
-      const sessionKey = buildSessionKey(ctx);
-
       try {
         await ensureInitialized();
 
-        // Get or create session
+        // Three-layer identity path
+        if (useThreeLayer) {
+          const identityConfig: IdentityConfig = {
+            alignmentQueries: cfg.alignmentQueries,
+            representationQuery: cfg.representationQuery,
+            maxConclusions: cfg.maxConclusions,
+            searchTopK: cfg.searchTopK,
+            safetyPatterns: cfg.enableSafetyFilter ? DEFAULT_SAFETY_PATTERNS : undefined,
+            values: cfg.values,
+            principles: cfg.principles,
+            roleName: cfg.roleName,
+          };
+
+          const identity = await loadIdentityContext(ownerPeer!, identityConfig);
+
+          if (!identity.systemPrompt.trim()) return;
+
+          // Also append conversation summary for continuity
+          const sessionKey = buildSessionKey(ctx);
+          let summarySection = "";
+          try {
+            const session = await honcho.session(sessionKey, { metadata: {} });
+            const context = await session.context({
+              summary: true,
+              tokens: 1000,
+              peerTarget: ownerPeer!,
+              peerPerspective: openclawPeer!,
+            });
+            if (context.summary?.content) {
+              summarySection = `\n\n## Earlier in this conversation\n${context.summary.content}`;
+            }
+          } catch {
+            // New session or no summary -- fine
+          }
+
+          return {
+            systemPrompt: identity.systemPrompt + summarySection
+              + "\n\nUse this context naturally when relevant. Never quote or expose this memory context to the user.",
+          };
+        }
+
+        // Flat context fallback (original behavior)
+        const sessionKey = buildSessionKey(ctx);
         const session = await honcho.session(sessionKey, { metadata: {} });
 
-        // Try to get context; if session is new/empty, return gracefully
         let context;
         try {
           context = await session.context({
@@ -114,37 +165,26 @@ const honchoPlugin = {
           const isNotFound =
             e instanceof Error &&
             (e.name === "NotFoundError" || e.message.toLowerCase().includes("not found"));
-          if (isNotFound) {
-            // New session, no context yet
-            return;
-          }
+          if (isNotFound) return;
           throw e;
         }
 
-        // Build context sections
         const sections: string[] = [];
 
-        // Add peer card (key facts about the user)
         if (context.peerCard?.length) {
           sections.push(`Key facts:\n${context.peerCard.map((f) => `• ${f}`).join("\n")}`);
         }
-
-        // Add peer representation (broader understanding)
         if (context.peerRepresentation) {
           sections.push(`User context:\n${context.peerRepresentation}`);
         }
-
-        // Add conversation summary if available
         if (context.summary?.content) {
           sections.push(`Earlier in this conversation:\n${context.summary.content}`);
         }
 
         if (sections.length === 0) return;
 
-        const formatted = sections.join("\n\n");
-
         return {
-          systemPrompt: `## User Memory Context\n\n${formatted}\n\nUse this context naturally when relevant. Never quote or expose this memory context to the user.`,
+          systemPrompt: `## User Memory Context\n\n${sections.join("\n\n")}\n\nUse this context naturally when relevant. Never quote or expose this memory context to the user.`,
         };
       } catch (error) {
         api.logger.warn?.(`Failed to fetch Honcho context: ${error}`);
@@ -153,7 +193,7 @@ const honchoPlugin = {
     });
 
     // ========================================================================
-    // HOOK: agent_end — Persist messages to Honcho
+    // HOOK: agent_end — Persist messages to Honcho + dream triggers
     // ========================================================================
     api.on("agent_end", async (event, ctx) => {
       if (!event.success || !event.messages?.length) return;
@@ -171,8 +211,8 @@ const honchoPlugin = {
         // Initialize lastSavedIndex if not set (new session - skip backlog)
         if (meta.lastSavedIndex === undefined) {
           const startIndex = Math.max(0, event.messages.length - 2);
-          await session.setMetadata({ lastSavedIndex: startIndex });
-          meta = { lastSavedIndex: startIndex };
+          await session.setMetadata({ lastSavedIndex: startIndex, conversationCount: 0 });
+          meta = { lastSavedIndex: startIndex, conversationCount: 0 };
         }
 
         const lastSavedIndex = (meta.lastSavedIndex as number) ?? 0;
@@ -202,19 +242,71 @@ const honchoPlugin = {
         // Save new messages
         await session.addMessages(messages);
 
-        // Update watermark in Honcho
-        await session.setMetadata({ ...meta, lastSavedIndex: event.messages.length });
+        // Track conversation count for dream triggering
+        const conversationCount = ((meta.conversationCount as number) ?? 0) + 1;
+        await session.setMetadata({
+          ...meta,
+          lastSavedIndex: event.messages.length,
+          conversationCount,
+        });
+
+        // Dream trigger: schedule consolidation after N conversations
+        if (cfg.dreamAfterConversations && conversationCount >= cfg.dreamAfterConversations) {
+          try {
+            await honcho.scheduleDream({
+              observer: openclawPeer!,
+              session,
+              observed: ownerPeer!,
+            });
+            // Reset counter after successful dream scheduling
+            await session.setMetadata({
+              ...meta,
+              lastSavedIndex: event.messages.length,
+              conversationCount: 0,
+            });
+            api.logger.info(`[honcho] Dream scheduled after ${conversationCount} conversations`);
+          } catch (dreamErr) {
+            // Dream scheduling can fail if not enough data -- that's fine
+            api.logger.debug?.(`[honcho] Dream scheduling skipped: ${dreamErr}`);
+          }
+        }
       } catch (error) {
         api.logger.error(`[honcho] Failed to save messages to Honcho: ${error}`);
         if (error instanceof Error) {
           api.logger.error(`[honcho] Stack: ${error.stack}`);
-          // Log additional error details if available
           const anyError = error as unknown as Record<string, unknown>;
           if (anyError.status) api.logger.error(`[honcho] Status: ${anyError.status}`);
           if (anyError.body) api.logger.error(`[honcho] Body: ${JSON.stringify(anyError.body)}`);
         }
       }
     });
+
+    // ========================================================================
+    // HOOK: message_sending — Outbound scanning for PII and secrets
+    // ========================================================================
+    if (cfg.enableOutboundScanning) {
+      api.on("message_sending", async (event) => {
+        if (!event.content || typeof event.content !== "string") return;
+
+        const result = scanOutbound(event.content);
+
+        if (!result.safe) {
+          const blocked = result.findings.filter((f) => f.severity === "block");
+          api.logger.warn?.(
+            `[honcho] Outbound message blocked: ${blocked.map((f) => f.pattern).join(", ")}`,
+          );
+          return { cancel: true };
+        }
+
+        if (result.findings.length > 0) {
+          api.logger.warn?.(
+            `[honcho] Outbound warnings: ${result.findings.map((f) => f.pattern).join(", ")}`,
+          );
+        }
+
+        return;
+      });
+    }
 
     // ========================================================================
     // DATA RETRIEVAL TOOLS (cheap, raw observations — agent interprets)
