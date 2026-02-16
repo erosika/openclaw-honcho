@@ -171,11 +171,17 @@ describe("honchoConfigSchema.parse", () => {
     expect(cfg.identityTimeoutMs).toBeUndefined();
   });
 
-  it("parses NaN HONCHO_DREAM_AFTER as NaN", () => {
+  it("returns undefined for non-numeric HONCHO_DREAM_AFTER", () => {
     process.env.HONCHO_DREAM_AFTER = "not_a_number";
     const cfg = honchoConfigSchema.parse({});
-    // parseInt("not_a_number") returns NaN
-    expect(cfg.dreamAfterConversations).toBeNaN();
+    // NaN from parseInt is converted to undefined (not silently stored)
+    expect(cfg.dreamAfterConversations).toBeUndefined();
+  });
+
+  it("returns undefined for non-numeric HONCHO_IDENTITY_TIMEOUT", () => {
+    process.env.HONCHO_IDENTITY_TIMEOUT = "abc";
+    const cfg = honchoConfigSchema.parse({});
+    expect(cfg.identityTimeoutMs).toBeUndefined();
   });
 
   it("handles empty HONCHO_ALIGNMENT_QUERIES", () => {

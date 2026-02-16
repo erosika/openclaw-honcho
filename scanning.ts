@@ -90,9 +90,11 @@ export function scanOutbound(
   const scannable = stripCodeBlocks(text);
 
   for (const { name, pattern, severity } of patterns) {
-    // Reset lastIndex for global patterns
-    pattern.lastIndex = 0;
-    const matches = scannable.matchAll(new RegExp(pattern, "g"));
+    // Create global copy preserving original flags (e.g., case-insensitive /i).
+    // new RegExp(pattern, "g") would discard flags like /i, causing case-sensitive
+    // patterns to silently miss matches (e.g., api_key=x vs API_KEY=x).
+    const globalPattern = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : pattern.flags + "g");
+    const matches = scannable.matchAll(globalPattern);
     for (const match of matches) {
       findings.push({
         pattern: name,
@@ -110,15 +112,63 @@ export function scanOutbound(
 /**
  * Redact matched patterns from text.
  * Replaces matches with [REDACTED] markers.
+ * Code blocks (fenced and inline) are preserved -- only text outside
+ * code blocks is redacted, consistent with scanOutbound behavior.
  */
 export function redactOutbound(
   text: string,
   patterns: ScanPattern[] = DEFAULT_SCAN_PATTERNS,
 ): string {
-  let redacted = text;
-  for (const { pattern } of patterns) {
-    pattern.lastIndex = 0;
-    redacted = redacted.replace(new RegExp(pattern, "g"), "[REDACTED]");
+  // Split text into code and non-code segments to preserve code blocks.
+  // This matches scanOutbound's behavior of ignoring code examples.
+  const segments: Array<{ text: string; isCode: boolean }> = [];
+  // Extract fenced code blocks first
+  const fencedRe = /```[\s\S]*?```/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = fencedRe.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      segments.push({ text: text.slice(lastIndex, match.index), isCode: false });
+    }
+    segments.push({ text: match[0], isCode: true });
+    lastIndex = fencedRe.lastIndex;
   }
-  return redacted;
+  if (lastIndex < text.length) {
+    segments.push({ text: text.slice(lastIndex), isCode: false });
+  }
+
+  // Now process non-code segments for inline code
+  const finalSegments: Array<{ text: string; isCode: boolean }> = [];
+  for (const seg of segments) {
+    if (seg.isCode) {
+      finalSegments.push(seg);
+      continue;
+    }
+    const inlineRe = /`[^`]+`/g;
+    let inlineLast = 0;
+    let inlineMatch: RegExpExecArray | null;
+    while ((inlineMatch = inlineRe.exec(seg.text)) !== null) {
+      if (inlineMatch.index > inlineLast) {
+        finalSegments.push({ text: seg.text.slice(inlineLast, inlineMatch.index), isCode: false });
+      }
+      finalSegments.push({ text: inlineMatch[0], isCode: true });
+      inlineLast = inlineRe.lastIndex;
+    }
+    if (inlineLast < seg.text.length) {
+      finalSegments.push({ text: seg.text.slice(inlineLast), isCode: false });
+    }
+  }
+
+  // Redact only non-code segments
+  return finalSegments.map((seg) => {
+    if (seg.isCode) return seg.text;
+    let redacted = seg.text;
+    for (const { pattern, severity } of patterns) {
+      if (severity !== "block") continue;
+      // Preserve original flags (especially /i) when adding /g
+      const globalPattern = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : pattern.flags + "g");
+      redacted = redacted.replace(globalPattern, "[REDACTED]");
+    }
+    return redacted;
+  }).join("");
 }

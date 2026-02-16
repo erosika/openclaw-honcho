@@ -186,13 +186,14 @@ export function stripInternalContext(
 
   const lines = representation.split("\n");
   const filtered = lines.filter(
-    (line) => !patterns.some((pattern) => pattern.test(line)),
+    (line) => !patterns.some((pattern) => {
+      // Reset lastIndex BEFORE each test to prevent global-flag corruption.
+      // Without this, a /g pattern's lastIndex advances per call, causing
+      // alternating match/miss behavior across lines.
+      pattern.lastIndex = 0;
+      return pattern.test(line);
+    }),
   );
-
-  // Reset lastIndex on any global-flagged patterns
-  for (const p of patterns) {
-    p.lastIndex = 0;
-  }
 
   const result = filtered.join("\n").trim();
   return result || null;

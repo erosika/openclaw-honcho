@@ -164,6 +164,14 @@ describe("scanOutbound", () => {
     expect(result.safe).toBe(true);
   });
 
+  it("preserves case-insensitive flag on patterns", () => {
+    // env-secret pattern has /i flag. Without flag preservation,
+    // lowercase variants would silently pass through.
+    const result = scanOutbound("Set api_key=my_super_secret_value");
+    expect(result.safe).toBe(false);
+    expect(result.findings.some((f) => f.pattern === "env-secret")).toBe(true);
+  });
+
   // Code block exemption tests
   it("ignores secrets inside fenced code blocks", () => {
     const text = "Here's how to set it up:\n```\nexport API_KEY=your_secret_here\n```\nThat's it!";
@@ -225,5 +233,32 @@ describe("redactOutbound", () => {
   it("redacts bearer tokens", () => {
     const result = redactOutbound("Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6");
     expect(result).not.toContain("eyJhbGci");
+  });
+
+  // Code block preservation tests
+  it("preserves secrets inside fenced code blocks", () => {
+    const text = "Example:\n```\nexport API_KEY=secret123\n```\nReal path: /Users/eri/app";
+    const result = redactOutbound(text);
+    // Fenced code should be preserved
+    expect(result).toContain("API_KEY=secret123");
+    // Real path outside code should be redacted
+    expect(result).not.toContain("/Users/eri");
+    expect(result).toContain("[REDACTED]");
+  });
+
+  it("preserves secrets inside inline code", () => {
+    const text = "Run `export TOKEN=abc` but /Users/eri/docs is real";
+    const result = redactOutbound(text);
+    expect(result).toContain("`export TOKEN=abc`");
+    expect(result).not.toContain("/Users/eri");
+  });
+
+  it("redacts only outside code blocks when mixed", () => {
+    const text = "Code: `sk-example123456789abcdefg` and key: sk-real123456789abcdefghij";
+    const result = redactOutbound(text);
+    // Inline code preserved
+    expect(result).toContain("`sk-example123456789abcdefg`");
+    // Real key outside redacted
+    expect(result).not.toContain("sk-real123456789abcdefghij");
   });
 });

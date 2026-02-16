@@ -111,6 +111,27 @@ describe("stripInternalContext", () => {
     expect(result).not.toContain("webhooks");
     expect(result).toContain("Precision");
   });
+
+  it("handles global-flagged custom patterns correctly", () => {
+    // Global patterns advance lastIndex on each .test() call.
+    // Without resetting, lines 2,4,6... would be missed.
+    const globalPattern = [/secret/gi];
+    const text = "secret line 1\npublic line\nsecret line 2\ngood line\nsecret line 3";
+    const result = stripInternalContext(text, globalPattern);
+    expect(result).not.toContain("secret");
+    expect(result).toContain("public");
+    expect(result).toContain("good");
+  });
+
+  it("handles repeated calls with same patterns (lastIndex stability)", () => {
+    const patterns = [/budget/i];
+    const text = "Budget $10\nValues matter";
+    // Call twice with same patterns to ensure no lastIndex leak
+    stripInternalContext(text, patterns);
+    const result = stripInternalContext(text, patterns);
+    expect(result).not.toContain("Budget");
+    expect(result).toContain("Values");
+  });
 });
 
 // ============================================================================

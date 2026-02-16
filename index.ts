@@ -10,7 +10,7 @@ import { Honcho, type Peer, type Session, type MessageInput } from "@honcho-ai/s
 // @ts-ignore - resolved by openclaw runtime
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { honchoConfigSchema, type HonchoConfig } from "./config.js";
-import { loadIdentityContext, DEFAULT_SAFETY_PATTERNS, type IdentityConfig } from "./identity.js";
+import { loadIdentityContext, stripInternalContext, DEFAULT_SAFETY_PATTERNS, type IdentityConfig } from "./identity.js";
 import { scanOutbound, DEFAULT_SCAN_PATTERNS, type ScanPattern } from "./scanning.js";
 
 // ============================================================================
@@ -52,6 +52,12 @@ const honchoPlugin = {
     let initFailed = false;
     let initPromise: Promise<void> | null = null;
     let agentEndLock: Promise<void> | null = null;
+    let currentSessionKey: string = "default";
+
+    // Short-lived identity cache to prevent redundant API calls on rapid-fire messages.
+    // Cache TTL of 30s means identity refreshes at most every 30 seconds.
+    let identityCache: { result: Awaited<ReturnType<typeof loadIdentityContext>>; expiresAt: number } | null = null;
+    const IDENTITY_CACHE_TTL_MS = 30_000;
 
     /**
      * Build a Honcho session key from OpenClaw context.
@@ -64,13 +70,14 @@ const honchoPlugin = {
       let combined = `${baseKey}-${provider}`;
       // Replace any non-alphanumeric characters with hyphens
       combined = combined.replace(/[^a-zA-Z0-9-]/g, "-");
-      // Collapse consecutive hyphens
-      combined = combined.replace(/-{2,}/g, "-");
+      // Collapse consecutive hyphens and trim leading/trailing
+      combined = combined.replace(/-{2,}/g, "-").replace(/^-|-$/g, "");
       // Truncate to 128 chars to stay within Honcho limits
       if (combined.length > 128) {
         combined = combined.slice(0, 128);
       }
-      return combined;
+      // Fallback for entirely empty keys (all non-alphanumeric input)
+      return combined || "default";
     }
 
     async function ensureInitialized(): Promise<void> {
@@ -123,8 +130,11 @@ const honchoPlugin = {
     const useThreeLayer = !!(cfg.alignmentQueries?.length || cfg.representationQuery || cfg.values || cfg.principles?.length);
 
     api.on("before_agent_start", async (event, ctx) => {
-      // Skip if no meaningful prompt
-      if (!event.prompt || event.prompt.length < 5) return;
+      // Skip empty prompts (health checks, system pings) but allow short ones ("hi", "hey")
+      if (!event.prompt) return;
+
+      // Track session key so tools can access the correct session
+      currentSessionKey = buildSessionKey(ctx);
 
       try {
         await ensureInitialized();
@@ -150,7 +160,15 @@ const honchoPlugin = {
             timeoutMs: cfg.identityTimeoutMs,
           };
 
-          const identity = await loadIdentityContext(ownerPeer!, identityConfig);
+          // Use cached identity if still fresh (prevents redundant API calls on rapid messages)
+          let identity;
+          const now = Date.now();
+          if (identityCache && identityCache.expiresAt > now) {
+            identity = identityCache.result;
+          } else {
+            identity = await loadIdentityContext(ownerPeer!, identityConfig);
+            identityCache = { result: identity, expiresAt: now + IDENTITY_CACHE_TTL_MS };
+          }
 
           if (!identity.systemPrompt.trim()) return;
 
@@ -166,7 +184,16 @@ const honchoPlugin = {
               peerPerspective: openclawPeer!,
             });
             if (context.summary?.content) {
-              summarySection = `\n\n## Earlier in this conversation\n${context.summary.content}`;
+              let summaryContent = context.summary.content;
+              // Apply safety filter to summary to prevent infrastructure details
+              // from the current session leaking into the identity prompt
+              if (cfg.enableSafetyFilter) {
+                const filtered = stripInternalContext(summaryContent, DEFAULT_SAFETY_PATTERNS);
+                summaryContent = filtered ?? "";
+              }
+              if (summaryContent) {
+                summarySection = `\n\n## Earlier in this conversation\n${summaryContent}`;
+              }
             }
           } catch {
             // New session or no summary -- fine
@@ -204,10 +231,23 @@ const honchoPlugin = {
           sections.push(`Key facts:\n${context.peerCard.map((f) => `• ${f}`).join("\n")}`);
         }
         if (context.peerRepresentation) {
-          sections.push(`User context:\n${context.peerRepresentation}`);
+          // Apply safety filter to representation in flat fallback too
+          let repr: string | null = context.peerRepresentation;
+          if (cfg.enableSafetyFilter) {
+            repr = stripInternalContext(repr, DEFAULT_SAFETY_PATTERNS);
+          }
+          if (repr) {
+            sections.push(`User context:\n${repr}`);
+          }
         }
         if (context.summary?.content) {
-          sections.push(`Earlier in this conversation:\n${context.summary.content}`);
+          let summaryContent = context.summary.content;
+          if (cfg.enableSafetyFilter) {
+            summaryContent = stripInternalContext(summaryContent, DEFAULT_SAFETY_PATTERNS) ?? "";
+          }
+          if (summaryContent) {
+            sections.push(`Earlier in this conversation:\n${summaryContent}`);
+          }
         }
 
         if (sections.length === 0) return;
@@ -245,14 +285,17 @@ const honchoPlugin = {
         const session = await honcho.session(sessionKey, { metadata: {} });
         let meta = await session.getMetadata();
 
-        // Initialize lastSavedIndex if not set (new session - skip backlog)
+        // Initialize lastSavedIndex if not set (new session - save recent context)
+        // Save up to last 10 messages on first invocation to establish context.
+        // Avoids dumping entire message history from before Honcho was installed.
         if (meta.lastSavedIndex === undefined) {
-          const startIndex = Math.max(0, event.messages.length - 2);
+          const startIndex = Math.max(0, event.messages.length - 10);
           await session.setMetadata({ lastSavedIndex: startIndex, conversationCount: 0, peersAdded: false });
           meta = { lastSavedIndex: startIndex, conversationCount: 0, peersAdded: false };
         }
 
-        const lastSavedIndex = (meta.lastSavedIndex as number) ?? 0;
+        // Safe coercion: Honcho metadata values may be stringified from JSON
+        const lastSavedIndex = Number(meta.lastSavedIndex) || 0;
 
         // Add peers if not already added (tracked in metadata to avoid redundant API calls)
         if (!meta.peersAdded) {
@@ -282,8 +325,8 @@ const honchoPlugin = {
         // Save new messages
         await session.addMessages(messages);
 
-        // Track conversation count for dream triggering
-        const conversationCount = ((meta.conversationCount as number) ?? 0) + 1;
+        // Track conversation count for dream triggering (safe coercion from possible string)
+        const conversationCount = (Number(meta.conversationCount) || 0) + 1;
         const updatedMeta = {
           ...meta,
           lastSavedIndex: event.messages.length,
@@ -447,9 +490,9 @@ Parameters:
 
           await ensureInitialized();
 
-          // Always use "default" -- session scoping is handled by buildSessionKey in hooks,
-          // not by tool parameters (prevents session key injection)
-          const sessionKey = "default";
+          // Use the session key tracked from before_agent_start (set per invocation).
+          // Not exposed as a tool parameter to prevent session key injection.
+          const sessionKey = currentSessionKey;
 
           try {
             const session = await honcho.session(sessionKey);
@@ -683,7 +726,7 @@ Use honcho_search if you want the raw evidence to reason over yourself.`,
 
           await ensureInitialized();
 
-          const representation = await ownerPeer!.representation({
+          let representation = await ownerPeer!.representation({
             searchQuery: query,
             searchTopK: topK ?? 10,
             searchMaxDistance: maxDistance ?? 0.5,
@@ -701,8 +744,16 @@ Use honcho_search if you want the raw evidence to reason over yourself.`,
             };
           }
 
+          // Apply safety filter to tool results when enabled, preventing
+          // operational data from leaking through tool calls even though
+          // the identity loading filters it from the system prompt.
+          if (cfg.enableSafetyFilter) {
+            // stripInternalContext and DEFAULT_SAFETY_PATTERNS imported at top level
+            representation = stripInternalContext(representation, DEFAULT_SAFETY_PATTERNS) ?? "";
+          }
+
           return {
-            content: [{ type: "text", text: `## Search Results: "${query}"\n\n${representation}` }],
+            content: [{ type: "text", text: representation ? `## Search Results: "${query}"\n\n${representation}` : `No relevant results for "${query}" after filtering.` }],
             details: undefined,
           };
         },
@@ -765,7 +816,7 @@ Parameters:
 
           await ensureInitialized();
 
-          const representation = await ownerPeer!.representation({
+          let representation = await ownerPeer!.representation({
             includeMostFrequent: includeMostFrequent ?? true,
           });
 
@@ -777,6 +828,19 @@ Parameters:
                   text: "No context available yet. Context builds over time through conversations.",
                 },
               ],
+              details: undefined,
+            };
+          }
+
+          // Apply safety filter to tool results when enabled
+          if (cfg.enableSafetyFilter) {
+            // stripInternalContext and DEFAULT_SAFETY_PATTERNS imported at top level
+            representation = stripInternalContext(representation, DEFAULT_SAFETY_PATTERNS) ?? "";
+          }
+
+          if (!representation) {
+            return {
+              content: [{ type: "text", text: "Context available but filtered for safety. Try honcho_profile for key facts." }],
               details: undefined,
             };
           }
@@ -834,10 +898,14 @@ Parameters:
           query: Type.String({
             description:
               "Simple factual question (e.g., 'What's their name?', 'What timezone?', 'Preferred language?')",
+            maxLength: 500,
           }),
         }),
         async execute(_toolCallId, params) {
           const { query } = params as { query: string };
+          if (query.length > 500) {
+            return { content: [{ type: "text", text: "Query too long. honcho_recall is for simple factual questions (max 500 chars). Use honcho_analyze for complex queries." }], details: undefined };
+          }
           await ensureInitialized();
           const answer = await openclawPeer!.chat(query, {
             target: ownerPeer!,
@@ -895,10 +963,14 @@ Use honcho_analyze if you need Honcho to synthesize a complex answer.`,
           query: Type.String({
             description:
               "Complex question requiring synthesis (e.g., 'Describe their communication style', 'What patterns in their concerns?')",
+            maxLength: 2000,
           }),
         }),
         async execute(_toolCallId, params) {
           const { query } = params as { query: string };
+          if (query.length > 2000) {
+            return { content: [{ type: "text", text: "Query too long (max 2000 chars). Try a more focused question." }], details: undefined };
+          }
           await ensureInitialized();
           const answer = await openclawPeer!.chat(query, {
             target: ownerPeer!,
@@ -986,10 +1058,12 @@ Use honcho_analyze if you need Honcho to synthesize a complex answer.`,
           .action(async (query: string, options: { topK: string; maxDistance: string }) => {
             try {
               await ensureInitialized();
+              const topK = parseInt(options.topK, 10);
+              const maxDistance = parseFloat(options.maxDistance);
               const representation = await ownerPeer!.representation({
                 searchQuery: query,
-                searchTopK: parseInt(options.topK, 10),
-                searchMaxDistance: parseFloat(options.maxDistance),
+                searchTopK: Number.isFinite(topK) ? topK : 10,
+                searchMaxDistance: Number.isFinite(maxDistance) ? maxDistance : 0.5,
               });
 
               if (!representation) {
@@ -1015,13 +1089,9 @@ Use honcho_analyze if you need Honcho to synthesize a complex answer.`,
 // ============================================================================
 
 /**
- * Strip OpenClaw's metadata tags and injected context from message content.
- * Removes:
- * - Platform headers: [Telegram Name id:123456 timestamp]
- * - Message IDs: [message_id: xxx]
- * - Honcho memory blocks: <honcho-memory>...</honcho-memory>
+ * Strip OpenClaw metadata from user messages (platform headers, message IDs).
  */
-function cleanMessageContent(content: string): string {
+function cleanUserContent(content: string): string {
   let cleaned = content;
   // Remove honcho-memory blocks (including hidden attribute and HTML comments)
   cleaned = cleaned.replace(/<honcho-memory[^>]*>[\s\S]*?<\/honcho-memory>\s*/gi, "");
@@ -1030,9 +1100,23 @@ function cleanMessageContent(content: string): string {
   cleaned = cleaned.replace(/^\[\w+\s+.+?\s+id:\d+\s+[^\]]+\]\s*/, "");
   // Remove trailing message_id: [message_id: xxx]
   cleaned = cleaned.replace(/\s*\[message_id:\s*[^\]]+\]\s*$/, "");
+  return cleaned.trim();
+}
+
+/**
+ * Strip leaked system prompt fragments from assistant messages.
+ * Only applied to assistant content to avoid stripping legitimate user text
+ * that might contain headings like "## Identity".
+ */
+function cleanAssistantContent(content: string): string {
+  let cleaned = cleanUserContent(content);
   // Remove leaked system prompt sections that the LLM may echo back.
   // These create feedback loops where injected context gets re-memorized.
-  cleaned = cleaned.replace(/## (?:User Memory Context|Memory Status: Unavailable|Identity|Understanding|Recent Context|Earlier in this conversation)\n[\s\S]*?(?=\n## |\n\n[^#]|$)/g, "");
+  // Anchored to our specific section names to avoid false matches.
+  cleaned = cleaned.replace(/## (?:User Memory Context|Memory Status: Unavailable)\n[\s\S]*?(?=\n## |\n\n[^#]|$)/g, "");
+  // Remove identity layer sections only when they appear at the start or after
+  // another section (indicates system prompt echo, not natural content)
+  cleaned = cleaned.replace(/^## (?:Identity|Understanding|Recent Context|Values|Operating Principles|Earlier in this conversation)\n[\s\S]*?(?=\n## |\n\n[^#]|$)/gm, "");
   // Remove the trailing instruction line if echoed
   cleaned = cleaned.replace(/Use this context naturally when relevant\. Never quote or expose this memory context to the user\.\s*/g, "");
   return cleaned.trim();
@@ -1068,10 +1152,11 @@ function extractMessages(
         .join("\n");
     }
 
-    // Clean metadata tags from both user and assistant messages.
-    // User messages contain platform headers; assistant messages can contain
-    // leaked honcho-memory blocks from the injected system prompt.
-    content = cleanMessageContent(content);
+    // Clean metadata: user messages get platform header removal only.
+    // Assistant messages also get leaked system prompt removal to prevent
+    // feedback loops. Separate functions prevent stripping legitimate user
+    // content that might contain headings like "## Identity".
+    content = role === "assistant" ? cleanAssistantContent(content) : cleanUserContent(content);
 
     if (content) {
       const peer = role === "user" ? ownerPeer : openclawPeer;

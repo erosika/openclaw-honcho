@@ -93,20 +93,25 @@ export const honchoConfigSchema = {
       enableOutboundScanning: cfg.enableOutboundScanning === true
         || process.env.HONCHO_OUTBOUND_SCANNING === "true",
 
-      // Performance
+      // Performance (NaN from invalid env vars → undefined, not silent corruption)
       identityTimeoutMs:
         typeof cfg.identityTimeoutMs === "number" ? cfg.identityTimeoutMs
-          : process.env.HONCHO_IDENTITY_TIMEOUT ? parseInt(process.env.HONCHO_IDENTITY_TIMEOUT, 10)
+          : process.env.HONCHO_IDENTITY_TIMEOUT ? finiteOrUndefined(parseInt(process.env.HONCHO_IDENTITY_TIMEOUT, 10))
           : undefined,
 
-      // Dreams
+      // Dreams (NaN from invalid env vars → undefined, not silent corruption)
       dreamAfterConversations:
         typeof cfg.dreamAfterConversations === "number" ? cfg.dreamAfterConversations
-          : process.env.HONCHO_DREAM_AFTER ? parseInt(process.env.HONCHO_DREAM_AFTER, 10)
+          : process.env.HONCHO_DREAM_AFTER ? finiteOrUndefined(parseInt(process.env.HONCHO_DREAM_AFTER, 10))
           : undefined,
     };
   },
 };
+
+/** Return the number if finite, otherwise undefined. Prevents NaN from entering config. */
+function finiteOrUndefined(n: number): number | undefined {
+  return Number.isFinite(n) ? n : undefined;
+}
 
 /** Parse a value that might be a string array or undefined. */
 function parseStringArray(value: unknown): string[] | undefined {
