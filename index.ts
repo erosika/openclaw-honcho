@@ -71,9 +71,12 @@ const honchoPlugin = {
       combined = combined.replace(/[^a-zA-Z0-9-]/g, "-");
       // Collapse consecutive hyphens and trim leading/trailing
       combined = combined.replace(/-{2,}/g, "-").replace(/^-|-$/g, "");
-      // Truncate to 128 chars to stay within Honcho limits
+      // Truncate to 128 chars to stay within Honcho limits.
+      // Log truncation since collisions could merge different sessions.
       if (combined.length > 128) {
+        const original = combined;
         combined = combined.slice(0, 128);
+        api.logger.debug?.(`[honcho] Session key truncated from ${original.length} to 128 chars`);
       }
       // Fallback for entirely empty keys (all non-alphanumeric input)
       return combined || "default";
@@ -169,19 +172,27 @@ const honchoPlugin = {
 
           if (!identity.systemPrompt.trim()) return;
 
-          // Also append conversation summary for continuity
+          // Also append conversation summary for continuity.
+          // Timeout prevents slow Honcho from blocking agent startup.
           const sessionKey = buildSessionKey(ctx);
           let summarySection = "";
           try {
-            const session = await honcho.session(sessionKey, { metadata: {} });
-            const context = await session.context({
-              summary: true,
-              tokens: 1000,
-              peerTarget: ownerPeer!,
-              peerPerspective: openclawPeer!,
-            });
-            if (context.summary?.content) {
-              let summaryContent = context.summary.content;
+            const summaryTimeout = cfg.identityTimeoutMs ?? 5000;
+            const summaryResult = await Promise.race([
+              (async () => {
+                const session = await honcho.session(sessionKey, { metadata: {} });
+                const context = await session.context({
+                  summary: true,
+                  tokens: 1000,
+                  peerTarget: ownerPeer!,
+                  peerPerspective: openclawPeer!,
+                });
+                return context.summary?.content ?? null;
+              })(),
+              new Promise<null>((resolve) => setTimeout(() => resolve(null), summaryTimeout)),
+            ]);
+            if (summaryResult) {
+              let summaryContent = summaryResult;
               // Apply safety filter to summary to prevent infrastructure details
               // from the current session leaking into the identity prompt
               if (cfg.enableSafetyFilter) {
