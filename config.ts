@@ -31,14 +31,22 @@ export type HonchoConfig = {
  * Resolve environment variable references in config values.
  * Supports ${ENV_VAR} syntax.
  */
-function resolveEnvVars(value: string): string {
-  return value.replace(/\$\{([^}]+)\}/g, (_, envVar) => {
+/**
+ * Resolve ${ENV_VAR} references in config values.
+ * Returns undefined if any referenced variable is missing (rather than
+ * throwing, which would crash plugin registration).
+ */
+function resolveEnvVars(value: string): string | undefined {
+  let missing = false;
+  const resolved = value.replace(/\$\{([^}]+)\}/g, (original, envVar) => {
     const envValue = process.env[envVar];
     if (!envValue) {
-      throw new Error(`Environment variable ${envVar} is not set`);
+      missing = true;
+      return original; // preserve placeholder for debugging
     }
     return envValue;
   });
+  return missing ? undefined : resolved;
 }
 
 export const honchoConfigSchema = {

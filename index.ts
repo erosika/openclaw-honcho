@@ -6,12 +6,12 @@
  */
 
 import { Type } from "@sinclair/typebox";
-import { Honcho, type Peer, type Session, type MessageInput } from "@honcho-ai/sdk";
+import { Honcho, type Peer, type MessageInput } from "@honcho-ai/sdk";
 // @ts-ignore - resolved by openclaw runtime
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import { honchoConfigSchema, type HonchoConfig } from "./config.js";
+import { honchoConfigSchema } from "./config.js";
 import { loadIdentityContext, stripInternalContext, DEFAULT_SAFETY_PATTERNS, type IdentityConfig } from "./identity.js";
-import { scanOutbound, DEFAULT_SCAN_PATTERNS, type ScanPattern } from "./scanning.js";
+import { scanOutbound } from "./scanning.js";
 
 // ============================================================================
 // Constants

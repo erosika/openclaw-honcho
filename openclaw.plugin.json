@@ -59,6 +59,11 @@
         "default": false,
         "description": "Scan outbound messages for PII and secrets before sending"
       },
+      "identityTimeoutMs": {
+        "type": "number",
+        "default": 5000,
+        "description": "Timeout in ms for identity loading (or set HONCHO_IDENTITY_TIMEOUT)"
+      },
       "dreamAfterConversations": {
         "type": "number",
         "description": "Trigger a Honcho dream cycle after N conversations (or set HONCHO_DREAM_AFTER)"
@@ -116,6 +121,11 @@
       "label": "Outbound Scanning",
       "advanced": true,
       "help": "Scan outbound messages for secrets and PII"
+    },
+    "identityTimeoutMs": {
+      "label": "Identity Timeout",
+      "advanced": true,
+      "help": "Max time to wait for identity loading (prevents slow starts)"
     },
     "dreamAfterConversations": {
       "label": "Dream Interval",
