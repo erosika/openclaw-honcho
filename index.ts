@@ -1139,15 +1139,18 @@ function cleanUserContent(content: string): string {
  * Only applied to assistant content to avoid stripping legitimate user text
  * that might contain headings like "## Identity".
  */
-function cleanAssistantContent(content: string): string {
+export function cleanAssistantContent(content: string): string {
   let cleaned = cleanUserContent(content);
   // Remove leaked system prompt sections that the LLM may echo back.
   // These create feedback loops where injected context gets re-memorized.
   // Anchored to our specific section names to avoid false matches.
   cleaned = cleaned.replace(/## (?:User Memory Context|Memory Status: Unavailable)\n[\s\S]*?(?=\n## |\n\n[^#]|$)/g, "");
   // Remove identity layer sections only when they appear at the start or after
-  // another section (indicates system prompt echo, not natural content)
-  cleaned = cleaned.replace(/^## (?:Identity|Understanding|Recent Context|Values|Operating Principles|Earlier in this conversation)\n[\s\S]*?(?=\n## |\n\n[^#]|$)/gm, "");
+  // another section (indicates system prompt echo, not natural content).
+  // Uses (?![\s\S]) instead of $ because /m flag makes $ match end-of-line,
+  // which would cause the lazy [\s\S]*? to stop at the first line boundary
+  // instead of consuming the full multi-line section.
+  cleaned = cleaned.replace(/^## (?:Identity|Understanding|Recent Context|Values|Operating Principles|Earlier in this conversation)\n[\s\S]*?(?=\n## |\n\n[^#]|(?![\s\S]))/gm, "");
   // Remove the trailing instruction line if echoed
   cleaned = cleaned.replace(/Use this context naturally when relevant\. Never quote or expose this memory context to the user\.\s*/g, "");
   return cleaned.trim();

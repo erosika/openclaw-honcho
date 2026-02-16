@@ -10,6 +10,7 @@ import {
   redactOutbound,
   stripCodeBlocks,
 } from "../scanning.js";
+import { cleanAssistantContent } from "../index.js";
 
 // ============================================================================
 // Simulated Chat Scenarios
@@ -259,6 +260,50 @@ describe("Chat Scenario: Prompt construction edge cases", () => {
   });
 });
 
+describe("Chat Scenario: Leaked system prompt stripping", () => {
+  it("strips multi-line leaked identity sections from assistant content", () => {
+    const content = [
+      "## Identity",
+      "• eri builds autonomous AI agents",
+      "• Core values: essentialism, precision",
+      "",
+      "## Understanding",
+      "eri believes in headless sovereignty.",
+      "She prioritizes infrastructure over features.",
+      "",
+      "Here is my actual response to your question.",
+    ].join("\n");
+
+    const cleaned = cleanAssistantContent(content);
+    // Leaked sections should be fully stripped (including multi-line content)
+    expect(cleaned).not.toContain("autonomous AI agents");
+    expect(cleaned).not.toContain("headless sovereignty");
+    expect(cleaned).not.toContain("infrastructure over features");
+    // Real response preserved
+    expect(cleaned).toContain("actual response");
+  });
+
+  it("strips leaked section at end of message", () => {
+    const content = [
+      "Here is my response.",
+      "",
+      "## Values",
+      "Essentialism, precision, care.",
+    ].join("\n");
+
+    const cleaned = cleanAssistantContent(content);
+    expect(cleaned).toContain("my response");
+    expect(cleaned).not.toContain("Essentialism");
+  });
+
+  it("preserves natural headings that happen to match section names", () => {
+    // A user asking about identity should NOT have their question stripped
+    const content = "I can help you understand identity management in your application.";
+    const cleaned = cleanAssistantContent(content);
+    expect(cleaned).toContain("identity management");
+  });
+});
+
 describe("Chat Scenario: Code block edge cases in scanning", () => {
   it("handles nested-looking code blocks", () => {
     const text = "Outer text\n```\nInner `code` block\n```\nMore text with API_KEY=secret";
@@ -311,5 +356,32 @@ describe("Chat Scenario: Safety pattern edge cases", () => {
     const filtered = stripInternalContext(text, DEFAULT_SAFETY_PATTERNS);
     expect(filtered).toContain("github.com");
     expect(filtered).toContain("Values");
+  });
+
+  it("preserves philosophical discussions while stripping operational data", () => {
+    // Philosophical budget/health/error discussions should NOT be stripped
+    // Only operational data with dollar amounts, metrics, etc. should be
+    const text = [
+      "eri's budget allocation strategy prioritizes foundational infrastructure",
+      "Budget is $4.20 per day across all agents",
+      "Mental health is important in her approach to work",
+      "Health check report: all systems nominal",
+      "Trial and error rates vary across domains",
+      "Error rate spiked to 15% overnight",
+      "eri treats spending time wisely as a core value",
+      "Spending $0.05 per API call",
+    ].join("\n");
+
+    const filtered = stripInternalContext(text, DEFAULT_SAFETY_PATTERNS);
+    // Philosophical/natural uses preserved
+    expect(filtered).toContain("budget allocation strategy");
+    expect(filtered).toContain("Mental health");
+    expect(filtered).toContain("Trial and error");
+    expect(filtered).toContain("spending time wisely");
+    // Operational data stripped
+    expect(filtered).not.toContain("$4.20");
+    expect(filtered).not.toContain("Health check report");
+    expect(filtered).not.toContain("Error rate spiked");
+    expect(filtered).not.toContain("$0.05");
   });
 });

@@ -56,22 +56,23 @@ export type IdentityContext = {
  * Users can extend or replace these via config.
  */
 export const DEFAULT_SAFETY_PATTERNS: RegExp[] = [
-  /\$\d+\.\d{2,}/,                          // cost figures ($0.0042)
-  /budget|spending|cost.*usd|daily.*limit/i, // budget language
-  /\bport\s*\d{2,5}\b/i,                    // port numbers
-  /\b(?:droplet|thinkpad|raspberry|node)\b/i, // infrastructure names
-  /(?:\/Users\/|\/home\/)\w+\//,             // system paths
-  /\b100\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/,     // Tailscale IPs
-  /\b\w+\.tailnet[\w.-]*/,                   // Tailscale DNS
-  /health.*(?:check|report|status)/i,        // health reports
-  /error.*(?:rate|count|spike)/i,            // error metrics
-  /uptime.*\d+%/i,                           // uptime percentages
-  /cron|schedule.*(?:every|interval)/i,      // scheduling internals
-  /\b\d{12}\b/,                              // AWS account IDs (12 digits)
-  /\b\w+\.(?:internal|local)\b/,             // internal DNS names
-  /Bearer\s+[a-zA-Z0-9._~+/=-]+/i,          // bearer tokens
-  /\blocalhost:\d{2,5}\b/,                   // localhost URLs
-  /webhook[s]?\.[\w.-]+/i,                   // webhook URLs
+  /\$\d+\.\d{2,}/,                                     // cost figures ($0.0042)
+  /(?:budget|spending|cost|daily\s*limit).*\$\d/i,      // budget language with dollar amounts
+  /\$\d+\.?\d*.*(?:per\s+(?:day|hour|month)|daily|monthly)/i, // dollar amounts with frequency
+  /\bport\s*\d{2,5}\b/i,                               // port numbers
+  /\b(?:droplet|thinkpad|raspberry|node)\b/i,           // infrastructure names
+  /(?:\/Users\/|\/home\/)\w+\//,                        // system paths
+  /\b100\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/,                // Tailscale IPs
+  /\b\w+\.tailnet[\w.-]*/,                              // Tailscale DNS
+  /(?:health\s*check|health\s*report|health\s*(?:endpoint|server|monitor))/i, // health infrastructure
+  /(?:error\s+rate|error\s+count|error\s+spike).*\d/i,   // error metrics with numeric data
+  /uptime.*\d+%/i,                                      // uptime percentages
+  /cron|schedule.*(?:every|interval)/i,                  // scheduling internals
+  /\b\d{12}\b/,                                         // AWS account IDs (12 digits)
+  /\b\w+\.(?:internal|local)\b/,                        // internal DNS names
+  /Bearer\s+[a-zA-Z0-9._~+/=-]+/i,                     // bearer tokens
+  /\blocalhost:\d{2,5}\b/,                              // localhost URLs
+  /webhook[s]?\.[\w.-]+/i,                              // webhook URLs
 ];
 
 // ============================================================================
